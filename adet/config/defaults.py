@@ -12,6 +12,46 @@ _C.INPUT.HFLIP_TRAIN = True
 _C.INPUT.CROP.CROP_INSTANCE = True
 
 # ---------------------------------------------------------------------------- #
+# DCR Head
+# ---------------------------------------------------------------------------- #
+_C.MODEL.DCR = CN()
+
+# This is the number of foreground classes.
+_C.MODEL.DCR.NUM_CLASSES = 80
+_C.MODEL.DCR.IN_FEATURES = ["p2", "p3", "p4", "p5", "p6", "p7"]
+_C.MODEL.DCR.FPN_STRIDES = [4, 8, 16, 32, 64, 128]
+_C.MODEL.DCR.PRIOR_PROB = 0.01
+_C.MODEL.DCR.INFERENCE_TH_TRAIN = 0.05
+_C.MODEL.DCR.INFERENCE_TH_TEST = 0.05
+_C.MODEL.DCR.NMS_TH = 0.6
+_C.MODEL.DCR.PRE_NMS_TOPK_TRAIN = 1000
+_C.MODEL.DCR.PRE_NMS_TOPK_TEST = 1000
+_C.MODEL.DCR.POST_NMS_TOPK_TRAIN = 100
+_C.MODEL.DCR.POST_NMS_TOPK_TEST = 100
+_C.MODEL.DCR.TOP_LEVELS = 2
+_C.MODEL.DCR.NORM = "GN"  # Support GN or none
+_C.MODEL.DCR.USE_SCALE = True
+
+# Multiply centerness before threshold
+# This will affect the final performance by about 0.05 AP but save some time
+_C.MODEL.DCR.THRESH_WITH_CTR = False
+
+# Focal loss parameters
+_C.MODEL.DCR.LOSS_ALPHA = 0.25
+_C.MODEL.DCR.LOSS_GAMMA = 2.0
+_C.MODEL.DCR.SIZES_OF_INTEREST = [64, 128, 256, 512]
+_C.MODEL.DCR.USE_RELU = True
+
+_C.MODEL.DCR.NUM_CONVS = 4
+_C.MODEL.DCR.USE_DEFORMABLE = False
+
+# the number of convolutions used in the cls and bbox tower
+_C.MODEL.DCR.IS_IN_BOXES = "none"
+_C.MODEL.DCR.POS_RADIUS = 1.5
+_C.MODEL.DCR.LOC_LOSS_TYPE = 'giou'
+
+
+# ---------------------------------------------------------------------------- #
 # FCOS Head
 # ---------------------------------------------------------------------------- #
 _C.MODEL.FCOS = CN()

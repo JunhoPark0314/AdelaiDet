@@ -30,8 +30,6 @@ class LastLevelP6P7(nn.Module):
         p6 = self.p6(x)
         p7 = self.p7(F.relu(p6))
         return [p6, p7]
-
-
 class LastLevelP6(nn.Module):
     """
     This module is used in FCOS to generate extra layers
@@ -71,12 +69,14 @@ def build_fcos_resnet_fpn_backbone(cfg, input_shape: ShapeSpec):
     out_channels = cfg.MODEL.FPN.OUT_CHANNELS
     top_levels = cfg.MODEL.FCOS.TOP_LEVELS
     in_channels_top = out_channels
+
     if top_levels == 2:
         top_block = LastLevelP6P7(in_channels_top, out_channels, "p5")
     if top_levels == 1:
         top_block = LastLevelP6(in_channels_top, out_channels, "p5")
     elif top_levels == 0:
         top_block = None
+
     backbone = FPN(
         bottom_up=bottom_up,
         in_features=in_features,
