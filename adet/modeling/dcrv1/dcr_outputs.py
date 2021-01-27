@@ -205,11 +205,9 @@ class DCROutputs(nn.Module):
         pred_box = cat([reg_locations - reg_pred[:,:2] , reg_locations + reg_pred[:,2:]], dim=1)
         pred_box[pred_box < 0] = 0
         
-        """
         cls_weight = []
         reg_weight = []
         trg_weight = []
-        """
 
         for l in range(len(targets_per_im)):
             target = targets_per_im[l]
@@ -226,8 +224,9 @@ class DCROutputs(nn.Module):
             else:
                 iou_mean = 0.0
                 iou_std = 0.0
-
-            reg_in_boxes[:,l] *= (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+            
+            reg_pos_per_target = (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+            reg_in_boxes[:,l] *= reg_pos_per_target
 
             score_per_target = logits_pred[:,target_dict['gt_classes']].sigmoid()
             in_box_score = score_per_target.squeeze(1)[cls_in_boxes[:,l]]
@@ -239,22 +238,41 @@ class DCROutputs(nn.Module):
                 score_mean = 0.0
                 score_std = 0.0
 
-            cls_in_boxes[:,l] *= (score_per_target > score_mean + score_std * self.pos_sample_rate).squeeze(1)
+            cls_pos_per_target = (score_per_target > score_mean + score_std * self.pos_sample_rate).squeeze(1)
+            cls_in_boxes[:,l] *= cls_pos_per_target
 
-            """
-            reg_weight.append(self.compute_jid_weight())
+            # compute recall weight per each prediction
 
-            cls_loc = score_per_target[cls_in_boxes[:,l]]
-            cls_weight.append(self.compute_jid_weight(cls_loc > ))                
-            """
+            iou_dump = iou_per_target.squeeze(0)[reg_in_boxes[:,l]]
+            iou_iw_recall = ((iou_dump > 0.5).sum() / (len(iou_dump) + 1e-6))
+            reg_weight.append(1 - iou_iw_recall)
 
-        return cat([cls_in_boxes, reg_in_boxes], dim=0)
+            cls_dump = logits_pred[cls_in_boxes[:,l]].sigmoid()
+            cls_iw_recall = (cls_dump[:,target_dict["gt_classes"]] > self.pre_nms_thresh_test).sum() / ((cls_dump > self.pre_nms_thresh_test).sum() + 1e-6)
+            cls_weight.append(1 - cls_iw_recall)
+
+            trg_dump = pred_target[reg_in_boxes[:,l]].sigmoid()
+            trg_iw_recall = ((trg_dump > self.pre_nms_thresh_test).sum() / (len(trg_dump) + 1e-6))
+            trg_weight.append(1 - trg_iw_recall)
+
+        cls_weight = torch.stack(cls_weight)
+        reg_weight = torch.stack(reg_weight)
+        trg_weight = torch.stack(trg_weight)        
+
+        assert (cls_weight >= 0).all() and (cls_weight <= 1).all()
+        assert (reg_weight >= 0).all() and (reg_weight <= 1).all()
+        assert (trg_weight >= 0).all() and (trg_weight <= 1).all()
+
+        return cat([cls_in_boxes, reg_in_boxes], dim=0) , (cls_weight, reg_weight, trg_weight)
 
     def compute_DCR_for_locations(self, locations, targets, size_ranges, num_loc_list, logits_pred, reg_pred, pred_target):
         labels = []
         reg_targets = []
         cls_pos_inds = []
         reg_pos_inds = []
+        cls_weight = []
+        reg_weight = []
+        pt_weight = []
 
         xs, ys = locations[:, 0], locations[:, 1]
 
@@ -291,7 +309,7 @@ class DCROutputs(nn.Module):
                     bitmasks=bitmasks, radius=self.radius
                 )
             elif self.is_in_boxes == "above_threshold":
-                is_in_boxes = self.get_threshold_region(
+                is_in_boxes, (cls_weight_per_target, reg_weight_per_target, pt_weight_per_target) = self.get_threshold_region(
                     reg_targets_per_im, 
                     [x[im_i] for x in logits_pred], 
                     [x[im_i] for x in reg_pred], 
@@ -322,13 +340,31 @@ class DCROutputs(nn.Module):
 
             labels_per_im = labels_per_im[locations_to_gt_inds[:len_class_target]]
             labels_per_im[locations_to_min_area[:len_class_target] == INF] = self.num_classes
-            
-            labels.append(labels_per_im)
-            cls_pos_inds.append(locations_to_min_area[:-len(size_ranges)] != INF)
-            reg_targets.append(reg_targets_per_im)
-            reg_pos_inds.append(locations_to_min_area[-len(size_ranges):] != INF)
 
-        return {"labels": labels, "pos_inds": cls_pos_inds}, {"reg_targets": reg_targets, "pos_inds": reg_pos_inds}
+            cls_pos_inds_per_im = locations_to_min_area[:-len(size_ranges)] != INF
+            reg_pos_inds_per_im = locations_to_min_area[-len(size_ranges):] != INF
+            
+            cls_weight_per_im = torch.ones(len(labels_per_im), dtype=torch.float32, device=cls_weight_per_target.device)
+            cls_weight_per_im[cls_pos_inds_per_im] += cls_weight_per_target[locations_to_gt_inds][:-len(size_ranges)][cls_pos_inds_per_im]
+
+            reg_weight_per_im = torch.ones(len(reg_targets_per_im), dtype=torch.float32, device=reg_weight_per_target.device)
+            reg_weight_per_im[reg_pos_inds_per_im] += reg_weight_per_target[locations_to_gt_inds][-len(size_ranges):][reg_pos_inds_per_im]
+
+            pt_weight_per_im = torch.ones(len(reg_targets_per_im), dtype=torch.float32, device=pt_weight_per_target.device)
+            pt_weight_per_im[reg_pos_inds_per_im] += pt_weight_per_target[locations_to_gt_inds][-len(size_ranges):][reg_pos_inds_per_im]
+
+            labels.append(labels_per_im)
+            cls_pos_inds.append(cls_pos_inds_per_im)
+            cls_weight.append(cls_weight_per_im)
+
+            reg_targets.append(reg_targets_per_im)
+            reg_pos_inds.append(reg_pos_inds_per_im)
+            reg_weight.append(reg_weight_per_im)
+
+            pt_weight.append(pt_weight_per_im)
+
+        return {"labels": labels, "pos_inds": cls_pos_inds, "weight": cls_weight}, {"reg_targets": reg_targets, "pos_inds": reg_pos_inds, 
+                "reg_weight": reg_weight, "target_weight": pt_weight}
 
     def losses(self, logits_pred, reg_pred, pred_target, locations, gt_instances):
         """
@@ -353,6 +389,10 @@ class DCROutputs(nn.Module):
         cls_instances.pos_inds = cat([
             x.reshape(-1) for x in cls_training_target["pos_inds"]
         ])
+        cls_instances.weight = cat([
+            x.reshape(-1) for x in cls_training_target["weight"]
+        ])
+
         reg_instances.reg_targets = cat([
             # Reshape: (N, 1, Hi, Wi) -> (N*Hi*Wi,)
             x.reshape(-1, 4) for x in reg_training_target["reg_targets"]
@@ -360,6 +400,14 @@ class DCROutputs(nn.Module):
         reg_instances.pos_inds = cat([
             # Reshape: (N, 1, Hi, Wi) -> (N*Hi*Wi,)
             x.reshape(-1) for x in reg_training_target["pos_inds"]
+        ])
+        reg_instances.reg_weight = cat([
+            # Reshape: (N, 1, Hi, Wi) -> (N*Hi*Wi,)
+            x.reshape(-1) for x in reg_training_target["reg_weight"]
+        ])
+        reg_instances.target_weight = cat([
+            # Reshape: (N, 1, Hi, Wi) -> (N*Hi*Wi,)
+            x.reshape(-1) for x in reg_training_target["target_weight"]
         ])
 
         cls_instances.logits_pred = cat([
@@ -377,12 +425,12 @@ class DCROutputs(nn.Module):
 
         return self.dcr_losses(cls_instances, reg_instances)
     
-    def compute_jid_weight(self, pred_pos, target_pos):
+    def compute_recall_weight(self, pred_pos, target_pos, gt_channel=0):
+
         tp = (pred_pos * target_pos)
-        fp = (pred_pos * ~target_pos)
         fn = (~pred_pos * target_pos)
 
-        return tp.sum() / (tp.sum() + fp.sum() + fn.sum())
+        return tp.sum() / (tp.sum() + fn.sum())
 
     def dcr_losses(self, cls_instances, reg_instances):
         num_classes = cls_instances.logits_pred.size(1)
@@ -402,11 +450,15 @@ class DCROutputs(nn.Module):
         class_target[cls_pos_inds, labels[cls_pos_inds]] = 1
 
         # compute tp, fp, fn weight
+        tp = (cls_instances.logits_pred.sigmoid() > self.pre_nms_thresh_test) * class_target
+        fp = (cls_instances.logits_pred.sigmoid() > self.pre_nms_thresh_test) * (1 - class_target).bool()
+        cls_instances.weight[fp.any(dim=1)] += (1 - tp.sum() / (tp.sum() + fp.sum() + 1e-6))
+        cls_instances.weight /= cls_instances.weight.mean()
 
         class_loss = sigmoid_focal_loss_jit(
             cls_instances.logits_pred,
             class_target,
-            weight=cls_instances.weight if hasattr(cls_instances, "weight") else None,
+            weight=cls_instances.weight.unsqueeze(1) if hasattr(cls_instances, "weight") else None,
             alpha=self.focal_loss_alpha,
             gamma=self.focal_loss_gamma,
             reduction="sum",
@@ -420,18 +472,28 @@ class DCROutputs(nn.Module):
 
         target_anchor = torch.zeros_like(reg_instances.pred_target)
         target_anchor[reg_pos_inds] = 1
+
+        tp = (reg_instances.pred_target.sigmoid() > self.pre_nms_thresh_test) * target_anchor
+        fp = (reg_instances.pred_target.sigmoid() > self.pre_nms_thresh_test) * (1 - target_anchor).bool()
+        reg_instances.target_weight[fp] += (1 - tp.sum() / (tp.sum() + fp.sum() + 1e-6))
+        reg_instances.target_weight /= reg_instances.target_weight.mean()
+
         target_loss = sigmoid_focal_loss_jit(
             reg_instances.pred_target,
             target_anchor,
+            weight=reg_instances.target_weight if hasattr(reg_instances, "target_weight") else None,
             alpha=self.focal_loss_alpha,
             gamma=self.focal_loss_gamma,
             reduction="sum"
         ) / num_reg_pos_avg
 
         if reg_pos_inds.numel() > 0:
+
+            reg_instances.reg_weight /= reg_instances.reg_weight.mean()
             reg_loss = self.loc_loss_func(
                 reg_instances.reg_pred[reg_pos_inds],
                 reg_instances.reg_targets[reg_pos_inds],
+                #weight=reg_instances.reg_weight.unsqueeze(1) if hasattr(reg_instances, "reg_weight") else None,
             ) / num_reg_pos_avg
 
         else:
