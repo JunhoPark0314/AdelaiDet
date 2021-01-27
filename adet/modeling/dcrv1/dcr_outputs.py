@@ -1,3 +1,4 @@
+from collections import defaultdict
 import logging
 import torch
 from torch import nn
@@ -10,7 +11,7 @@ from fvcore.nn import sigmoid_focal_loss_jit
 
 from adet.utils.comm import reduce_sum
 from adet.layers import ml_nms, IOULoss
-
+from detectron2.structures import pairwise_iou
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ class DCROutputs(nn.Module):
             )
         return targets_level_first
 
-    def _get_ground_truth(self, locations, gt_instances, logits_pred, reg_pred):
+    def _get_ground_truth(self, locations, gt_instances, logits_pred, reg_pred, pred_target):
         num_cls_list = [len(locations[0])]
         num_loc_list = [len(loc) for loc in locations[1:]]
 
@@ -113,7 +114,7 @@ class DCROutputs(nn.Module):
         locations = torch.cat(locations, dim=0)
 
         cls_training_targets, reg_training_targets = self.compute_DCR_for_locations(
-            locations, gt_instances, loc_to_size_range, num_loc_list, logits_pred, reg_pred
+            locations, gt_instances, loc_to_size_range, num_loc_list, logits_pred, reg_pred, pred_target
         )
 
         # transpose im first training_targets to level first ones
@@ -178,8 +179,78 @@ class DCROutputs(nn.Module):
         center_bbox = torch.stack((left, top, right, bottom), -1)
         inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0
         return inside_gt_bbox_mask
+    
+    @torch.no_grad()
+    def get_threshold_region(
+        self, reg_targets_per_im, logits_pred, reg_pred, pred_target, reg_num_loc_list, targets_per_im, locations
+    ):
+        is_in_boxes = reg_targets_per_im.min(dim=2)[0] > 0
+        cls_in_boxes = is_in_boxes[:-sum(reg_num_loc_list)]
+        reg_in_boxes = is_in_boxes[-sum(reg_num_loc_list):]
 
-    def compute_DCR_for_locations(self, locations, targets, size_ranges, num_loc_list, logits_pred, reg_pred):
+        reg_locations = locations[-sum(reg_num_loc_list):]
+
+        C, H, W = logits_pred[0].shape
+
+        reg_pred = cat([
+            x.permute(1, 2, 0).reshape(-1, 4) * s for x, s in zip(reg_pred, self.strides[1:])
+        ])
+        logits_pred = cat([
+            x.permute(1, 2, 0).reshape(-1, self.num_classes) for x in logits_pred
+        ])
+        pred_target = cat([
+            x.permute(1, 2, 0).reshape(-1) for x in pred_target
+        ])
+
+        pred_box = cat([reg_locations - reg_pred[:,:2] , reg_locations + reg_pred[:,2:]], dim=1)
+        pred_box[pred_box < 0] = 0
+        
+        """
+        cls_weight = []
+        reg_weight = []
+        trg_weight = []
+        """
+
+        for l in range(len(targets_per_im)):
+            target = targets_per_im[l]
+            target_dict = target.get_fields()
+
+            # calculate logit, bbox regression threshold per object
+
+            iou_per_target = pairwise_iou(target_dict["gt_boxes"], Boxes(pred_box))
+            in_box_iou = iou_per_target.squeeze(0)[reg_in_boxes[:,l]]
+
+            if len(in_box_iou):
+                iou_mean = in_box_iou.mean()
+                iou_std = in_box_iou.std()
+            else:
+                iou_mean = 0.0
+                iou_std = 0.0
+
+            reg_in_boxes[:,l] *= (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+
+            score_per_target = logits_pred[:,target_dict['gt_classes']].sigmoid()
+            in_box_score = score_per_target.squeeze(1)[cls_in_boxes[:,l]]
+
+            if len(in_box_score):
+                score_mean = in_box_score.mean()
+                score_std = in_box_score.std()
+            else:
+                score_mean = 0.0
+                score_std = 0.0
+
+            cls_in_boxes[:,l] *= (score_per_target > score_mean + score_std * self.pos_sample_rate).squeeze(1)
+
+            """
+            reg_weight.append(self.compute_jid_weight())
+
+            cls_loc = score_per_target[cls_in_boxes[:,l]]
+            cls_weight.append(self.compute_jid_weight(cls_loc > ))                
+            """
+
+        return cat([cls_in_boxes, reg_in_boxes], dim=0)
+
+    def compute_DCR_for_locations(self, locations, targets, size_ranges, num_loc_list, logits_pred, reg_pred, pred_target):
         labels = []
         reg_targets = []
         cls_pos_inds = []
@@ -191,6 +262,10 @@ class DCROutputs(nn.Module):
             targets_per_im = targets[im_i]
             bboxes = targets_per_im.gt_boxes.tensor
             labels_per_im = targets_per_im.gt_classes
+
+            cls_weight_per_target = torch.ones_like(labels_per_im)
+            reg_weight_per_target = torch.ones_like(labels_per_im)
+            pt_weight_per_target = torch.ones_like(labels_per_im)
 
             # no gt
             if bboxes.numel() == 0:
@@ -217,7 +292,13 @@ class DCROutputs(nn.Module):
                 )
             elif self.is_in_boxes == "above_threshold":
                 is_in_boxes = self.get_threshold_region(
-                    reg_targets_per_im, logits_pred, reg_pred
+                    reg_targets_per_im, 
+                    [x[im_i] for x in logits_pred], 
+                    [x[im_i] for x in reg_pred], 
+                    [x[im_i] for x in  pred_target],
+                    num_loc_list, 
+                    targets_per_im, 
+                    locations
                 )
             else:
                 is_in_boxes = reg_targets_per_im.min(dim=2)[0] > 0
@@ -257,7 +338,7 @@ class DCROutputs(nn.Module):
             dict[loss name -> loss value]: A dict mapping from loss name to loss value.
         """
 
-        cls_training_target, reg_training_target = self._get_ground_truth(locations, gt_instances, logits_pred, reg_pred)
+        cls_training_target, reg_training_target = self._get_ground_truth(locations, gt_instances, logits_pred, reg_pred, pred_target)
 
         # Collect all logits and regression predictions over feature maps
         # and images to arrive at the same shape as the labels and targets
@@ -269,10 +350,6 @@ class DCROutputs(nn.Module):
         cls_instances.labels = cat([
             x.reshape(-1) for x in cls_training_target["labels"]
         ])
-        if "weight" in cls_training_target:
-            cls_instances.cls_weight = cat([
-                x.reshape(-1) for x in cls_training_target["cls_weight"]
-            ])
         cls_instances.pos_inds = cat([
             x.reshape(-1) for x in cls_training_target["pos_inds"]
         ])
@@ -299,6 +376,13 @@ class DCROutputs(nn.Module):
         ], dim=0,)
 
         return self.dcr_losses(cls_instances, reg_instances)
+    
+    def compute_jid_weight(self, pred_pos, target_pos):
+        tp = (pred_pos * target_pos)
+        fp = (pred_pos * ~target_pos)
+        fn = (~pred_pos * target_pos)
+
+        return tp.sum() / (tp.sum() + fp.sum() + fn.sum())
 
     def dcr_losses(self, cls_instances, reg_instances):
         num_classes = cls_instances.logits_pred.size(1)
@@ -316,6 +400,8 @@ class DCROutputs(nn.Module):
         # prepare one_hot
         class_target = torch.zeros_like(cls_instances.logits_pred)
         class_target[cls_pos_inds, labels[cls_pos_inds]] = 1
+
+        # compute tp, fp, fn weight
 
         class_loss = sigmoid_focal_loss_jit(
             cls_instances.logits_pred,

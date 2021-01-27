@@ -51,6 +51,9 @@ _C.MODEL.DCR.POS_RADIUS = 1.5
 _C.MODEL.DCR.LOC_LOSS_TYPE = 'giou'
 
 
+_C.MODEL.DCR.POS_SAMPLE_INIT = -1.0
+_C.MODEL.DCR.POS_SAMPLE_LIMIT = 0.5
+
 # ---------------------------------------------------------------------------- #
 # FCOS Head
 # ---------------------------------------------------------------------------- #

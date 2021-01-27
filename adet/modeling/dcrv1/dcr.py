@@ -9,6 +9,7 @@ from detectron2.modeling.proposal_generator.build import PROPOSAL_GENERATOR_REGI
 
 from adet.layers import DFConv2d, NaiveGroupNorm
 from adet.utils.comm import compute_locations
+from detectron2.utils.events import get_event_storage
 from .dcr_outputs import DCROutputs
 
 
@@ -53,6 +54,9 @@ class DCR(nn.Module):
         self.in_channels_to_top_module = self.dcr_head.in_channels_to_top_module
 
         self.dcr_outputs = DCROutputs(cfg)
+        self.pos_sample_rate = nn.Parameter(torch.Tensor([cfg.MODEL.DCR.POS_SAMPLE_INIT]), requires_grad=False)
+        self.pos_sample_limit = cfg.MODEL.DCR.POS_SAMPLE_LIMIT
+        self.max_iter = cfg.SOLVER.MAX_ITER
 
     def forward_head(self, features, top_module=None):
         features = [features[f] for f in self.in_features]
@@ -78,6 +82,9 @@ class DCR(nn.Module):
         logits_pred, reg_pred, pred_target = self.dcr_head(features)
 
         results = {}
+
+        self.pos_sample_rate += (self.pos_sample_limit - self.pos_sample_rate) * 2 / self.max_iter
+        self.dcr_outputs.pos_sample_rate = self.pos_sample_rate.item()
 
         if self.training:
             results, losses = self.dcr_outputs.losses(
