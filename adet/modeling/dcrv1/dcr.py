@@ -48,7 +48,6 @@ class DCR(nn.Module):
         super().__init__()
         self.in_features = cfg.MODEL.DCR.IN_FEATURES
         self.fpn_strides = cfg.MODEL.DCR.FPN_STRIDES
-        self.in_boxes = cfg.MODEL.DCR.IS_IN_BOXES
 
         self.dcr_head = DCRHead(cfg, {f:input_shape[f] for f in self.in_features})
         self.in_channels_to_top_module = self.dcr_head.in_channels_to_top_module

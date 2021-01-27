@@ -55,7 +55,7 @@ class DCROutputs(nn.Module):
 
         self.focal_loss_alpha = cfg.MODEL.DCR.LOSS_ALPHA
         self.focal_loss_gamma = cfg.MODEL.DCR.LOSS_GAMMA
-        self.center_sample = cfg.MODEL.DCR.CENTER_SAMPLE
+        self.is_in_boxes = cfg.MODEL.DCR.IS_IN_BOXES
         self.radius = cfg.MODEL.DCR.POS_RADIUS
         self.pre_nms_thresh_train = cfg.MODEL.DCR.INFERENCE_TH_TRAIN
         self.pre_nms_topk_train = cfg.MODEL.DCR.PRE_NMS_TOPK_TRAIN
