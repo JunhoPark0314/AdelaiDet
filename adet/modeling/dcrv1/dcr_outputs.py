@@ -184,11 +184,11 @@ class DCROutputs(nn.Module):
     
     @torch.no_grad()
     def get_threshold_region(
-        self, reg_targets_per_im, logits_pred, reg_pred, pred_target, reg_num_loc_list, targets_per_im, locations
+        self, reg_targets_per_im, logits_pred, reg_pred, pred_target, reg_num_loc_list, targets_per_im, locations, is_cared_in_level
     ):
-        is_in_boxes = reg_targets_per_im.min(dim=2)[0] > 0
+        is_in_boxes = (reg_targets_per_im.min(dim=2)[0] > 0) 
         cls_in_boxes = is_in_boxes[:-sum(reg_num_loc_list)]
-        reg_in_boxes = is_in_boxes[-sum(reg_num_loc_list):]
+        reg_in_boxes = is_in_boxes[-sum(reg_num_loc_list):] * is_cared_in_level
 
         reg_locations = locations[-sum(reg_num_loc_list):]
 
@@ -302,6 +302,13 @@ class DCROutputs(nn.Module):
             b = bboxes[:, 3][None] - ys[:, None]
             reg_targets_per_im = torch.stack([l, t, r, b], dim=2)
 
+            len_class_target = len(locations) - len(size_ranges)
+            max_reg_targets_per_im = reg_targets_per_im.max(dim=2)[0]
+            # limit the regression range for each location
+            is_cared_in_the_level = \
+                (max_reg_targets_per_im[-len(size_ranges):] >= size_ranges[:, [0]]) & \
+                (max_reg_targets_per_im[-len(size_ranges):] <= size_ranges[:, [1]])
+            
             if self.is_in_boxes == "center_sampling":
                 if targets_per_im.has("gt_bitmasks_full"):
                     bitmasks = targets_per_im.gt_bitmasks_full
@@ -319,17 +326,13 @@ class DCROutputs(nn.Module):
                     [x[im_i] for x in  pred_target],
                     num_loc_list, 
                     targets_per_im, 
-                    locations
+                    locations,
+                    is_cared_in_the_level
                 )
             else:
                 is_in_boxes = reg_targets_per_im.min(dim=2)[0] > 0
 
-            len_class_target = len(locations) - len(size_ranges)
-            max_reg_targets_per_im = reg_targets_per_im.max(dim=2)[0]
-            # limit the regression range for each location
-            is_cared_in_the_level = \
-                (max_reg_targets_per_im[-len(size_ranges):] >= size_ranges[:, [0]]) & \
-                (max_reg_targets_per_im[-len(size_ranges):] <= size_ranges[:, [1]])
+
 
             locations_to_gt_area = area[None].repeat(len(locations), 1)
             locations_to_gt_area[is_in_boxes == 0] = INF
