@@ -94,9 +94,14 @@ class DCR(nn.Module):
             
             return results, losses
         else:
-            results = self.dcr_outputs.predict_proposals(
+            cls_targets = None
+            reg_targets = None
+            if len(gt_instances[0]):
+                cls_targets, reg_targets = self.dcr_outputs._get_ground_truth(locations, gt_instances,
+                                                                    logits_pred, reg_pred, pred_target)
+            results, analysis = self.dcr_outputs.predict_proposals(
                 logits_pred, reg_pred, pred_target,
-                locations, images.image_sizes
+                locations, images.image_sizes, training_target = {"cls": cls_targets, "reg": reg_targets} if cls_targets is not None else None
             )
 
             return results, {}

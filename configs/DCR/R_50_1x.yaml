@@ -5,6 +5,7 @@ MODEL:
     DEPTH: 50
   DCR:
     IS_IN_BOXES: "above_threshold"
+    POS_SAMPLE_INIT: 0.5
 INPUT:
   MIN_SIZE_TRAIN: (800,)
 OUTPUT_DIR: "output/dcr/R_50_1x"

@@ -1,5 +1,6 @@
 from collections import defaultdict
 import logging
+from detectron2.structures.boxes import matched_boxlist_iou
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -129,6 +130,7 @@ class DCROutputs(nn.Module):
         # we normalize reg_targets by FPN's strides here
         reg_targets = reg_training_targets["reg_targets"]
         for l in range(len(reg_targets)):
+            #reg_targets[l] = reg_targets[l] / float(self.strides[l+1])
             reg_targets[l] = reg_targets[l] / float(self.strides[l])
 
         return cls_training_targets, reg_training_targets
@@ -273,6 +275,7 @@ class DCROutputs(nn.Module):
         cls_weight = []
         reg_weight = []
         pt_weight = []
+        reg_label = []
 
         xs, ys = locations[:, 0], locations[:, 1]
 
@@ -362,9 +365,12 @@ class DCROutputs(nn.Module):
             reg_weight.append(reg_weight_per_im)
 
             pt_weight.append(pt_weight_per_im)
+            reg_label_per_im = -torch.ones_like(reg_pos_inds_per_im, device=reg_pos_inds_per_im.device).long()
+            reg_label_per_im[reg_pos_inds_per_im] = targets_per_im.gt_classes[locations_to_gt_inds[-len(size_ranges):][reg_pos_inds_per_im]]
+            reg_label.append(reg_label_per_im)
 
         return {"labels": labels, "pos_inds": cls_pos_inds, "weight": cls_weight}, {"reg_targets": reg_targets, "pos_inds": reg_pos_inds, 
-                "reg_weight": reg_weight, "target_weight": pt_weight}
+                "reg_weight": reg_weight, "target_weight": pt_weight, "reg_label": reg_label}
 
     def losses(self, logits_pred, reg_pred, pred_target, locations, gt_instances):
         """
@@ -511,8 +517,8 @@ class DCROutputs(nn.Module):
         return extras, losses
 
     def predict_proposals(
-            self, logits_pred, reg_pred, ctrness_pred,
-            locations, image_sizes, top_feats=None
+            self, logits_pred, reg_pred, pred_target,
+            locations, image_sizes, training_target=None
     ):
         if self.training:
             self.pre_nms_thresh = self.pre_nms_thresh_train
@@ -524,15 +530,24 @@ class DCROutputs(nn.Module):
             self.post_nms_topk = self.post_nms_topk_test
 
         sampled_boxes = []
+        cls_analysis = []
+        reg_analysis = []
+        pt_analysis = []
 
         bundle = {
-            "l": locations, "o": logits_pred,
-            "r": reg_pred, "c": ctrness_pred,
-            "s": self.strides,
+            "l": locations[1:],
+            "r": reg_pred, "t": pred_target,
+            "s": self.strides[1:], 
         }
 
-        if len(top_feats) > 0:
-            bundle["t"] = top_feats
+        if training_target is not None:
+            reg_target = training_target["reg"]["reg_targets"]
+            pt_target = training_target["reg"]["pos_inds"]
+            reg_label = training_target["reg"]["reg_label"]
+
+            bundle["rt"] = reg_target
+            bundle["pt"] = pt_target
+            bundle["rl"] = reg_label
 
         for i, per_bundle in enumerate(zip(*bundle.values())):
             # get per-level bundle
@@ -540,16 +555,27 @@ class DCROutputs(nn.Module):
             # recall that during training, we normalize regression targets with FPN's stride.
             # we denormalize them here.
             l = per_bundle["l"]
-            o = per_bundle["o"]
-            r = per_bundle["r"] * per_bundle["s"]
-            c = per_bundle["c"]
-            t = per_bundle["t"] if "t" in bundle else None
+            o = logits_pred[0]
+            r = per_bundle["r"] * per_bundle["s"] / 2
+            t = per_bundle["t"] 
+            targets = None
 
-            sampled_boxes.append(
-                self.forward_for_single_feature_map(
-                    l, o, r, c, image_sizes, t
-                )
+            if training_target is not None:
+                rt = per_bundle["rt"] * per_bundle["s"] / 2
+                pt = per_bundle["pt"]
+                rl = per_bundle["rl"]
+                targets = [training_target["cls"], rt, pt, rl] if i == 0  else [None, rt, pt, rl]
+
+            boxes, analysis = self.forward_for_single_feature_map(
+                l, o, r, t, image_sizes, targets
             )
+            sampled_boxes.append(boxes)
+            if "cls" in analysis:
+                cls_analysis.append(analysis["cls"])
+            if "reg" in analysis:
+                reg_analysis.append(analysis["reg"])
+            if "pt" in analysis:
+                pt_analysis.append(analysis["pt"])
 
             for per_im_sampled_boxes in sampled_boxes[-1]:
                 per_im_sampled_boxes.fpn_levels = l.new_ones(
@@ -560,63 +586,105 @@ class DCROutputs(nn.Module):
         boxlists = [Instances.cat(boxlist) for boxlist in boxlists]
         boxlists = self.select_over_all_levels(boxlists)
 
-        return boxlists
+        return boxlists, [cls_analysis, reg_analysis, pt_analysis]
+
+    def calc_stat(self, true, positive):
+        tp = true * positive
+        fn = ~true * positive
+        fp = true * ~positive
+
+        jid = tp.sum() / (tp.sum() + fn.sum() + fp.sum())
+
+        return tp.sum(), fn.sum(), fp.sum(), jid
 
     def forward_for_single_feature_map(
             self, locations, logits_pred, reg_pred,
-            ctrness_pred, image_sizes, top_feat=None
+            pred_target, image_sizes, target_list=None
     ):
-        N, C, H, W = logits_pred.shape
+
+        results = []
+        analysis = defaultdict(list)
+
+        N, C, Hc, Wc = logits_pred.shape
 
         # put in the same format as locations
-        logits_pred = logits_pred.view(N, C, H, W).permute(0, 2, 3, 1)
+
+        cls_map = logits_pred
+        logits_pred = logits_pred.view(N, C, Hc, Wc).permute(0, 2, 3, 1)
         logits_pred = logits_pred.reshape(N, -1, C).sigmoid()
+
+        _, _, H, W = reg_pred.shape
+
         box_regression = reg_pred.view(N, 4, H, W).permute(0, 2, 3, 1)
         box_regression = box_regression.reshape(N, -1, 4)
-        ctrness_pred = ctrness_pred.view(N, 1, H, W).permute(0, 2, 3, 1)
-        ctrness_pred = ctrness_pred.reshape(N, -1).sigmoid()
-        if top_feat is not None:
-            top_feat = top_feat.view(N, -1, H, W).permute(0, 2, 3, 1)
-            top_feat = top_feat.reshape(N, H * W, -1)
+        pred_target = pred_target.view(N, 1, H, W).permute(0, 2, 3, 1)
+        pred_target = pred_target.reshape(N, -1).sigmoid()
+
+        # calculate true positive, false positive, false negative of prediction
+        if target_list is not None:
+            cls_trg, reg_trg, pt_trg, reg_label = target_list
+            if cls_trg is not None:
+                true_label = cls_trg["labels"][0]
+                label_pos = cls_trg["pos_inds"][0]
+
+                true = torch.zeros_like(logits_pred).bool()
+                true[:,label_pos,true_label[label_pos]] = 1
+                analysis["cls"].append(self.calc_stat(true, logits_pred > self.pre_nms_thresh))
+
+            reg_trg = cat([locations - reg_trg[:,:2], locations + reg_trg[:,2:]],dim=1)
+            box_pred = cat([locations - box_regression[0,:,:2], locations + box_regression[0,:,2:]], dim=1)
+            reg_trg[reg_trg < 0] = 0
+            box_pred[box_pred < 0] = 0
+            iou_trg = matched_boxlist_iou(Boxes(reg_trg), Boxes(box_pred))
+            iou_trg[~pt_trg] = 0
+
+            #analysis["reg"].append([self.calc_stat(iou_trg > 0.5, pred_target[0] > self.pre_nms_thresh)])
+            analysis["pt"].append(self.calc_stat(pt_trg, pred_target[0] > self.pre_nms_thresh))
+            #iou_trg[pt_trg]
 
         # if self.thresh_with_ctr is True, we multiply the classification
         # scores with centerness scores before applying the threshold.
-        if self.thresh_with_ctr:
-            logits_pred = logits_pred * ctrness_pred[:, :, None]
-        candidate_inds = logits_pred > self.pre_nms_thresh
-        pre_nms_top_n = candidate_inds.view(N, -1).sum(1)
+
+        if target_list is not None:
+            candidate_inds = iou_trg.unsqueeze(0) > self.pre_nms_thresh
+        else:
+            candidate_inds = pred_target > self.pre_nms_thresh
+        pre_nms_top_n = candidate_inds.reshape(N, -1).sum(1)
         pre_nms_top_n = pre_nms_top_n.clamp(max=self.pre_nms_topk)
 
-        if not self.thresh_with_ctr:
-            logits_pred = logits_pred * ctrness_pred[:, :, None]
+        """
+        candidate_inds = logits_pred > self.pre_nms_thresh
+        pre_nms_top_n = candidate_inds.reshape(N, -1).sum(1)
+        pre_nms_top_n = pre_nms_top_n.clamp(max=self.pre_nms_topk)
+        """
 
-        results = []
         for i in range(N):
-            per_box_cls = logits_pred[i]
+            per_cls_map = cls_map.sigmoid()
+            per_box_regression = box_regression[i]
+            per_box_pred_target = pred_target[i]
             per_candidate_inds = candidate_inds[i]
-            per_box_cls = per_box_cls[per_candidate_inds]
+            per_pre_nms_top_n = pre_nms_top_n[i]
 
             per_candidate_nonzeros = per_candidate_inds.nonzero()
             per_box_loc = per_candidate_nonzeros[:, 0]
-            per_class = per_candidate_nonzeros[:, 1]
-
-            per_box_regression = box_regression[i]
             per_box_regression = per_box_regression[per_box_loc]
+            per_box_pred_target = per_box_pred_target[per_box_loc]
             per_locations = locations[per_box_loc]
-            if top_feat is not None:
-                per_top_feat = top_feat[i]
-                per_top_feat = per_top_feat[per_box_loc]
 
-            per_pre_nms_top_n = pre_nms_top_n[i]
+            if target_list is not None:
+                per_reg_label = reg_label
+                per_reg_label = per_reg_label[per_box_loc]
+                per_iou_trg = iou_trg[per_box_loc]
 
             if per_candidate_inds.sum().item() > per_pre_nms_top_n.item():
-                per_box_cls, top_k_indices = \
-                    per_box_cls.topk(per_pre_nms_top_n, sorted=False)
-                per_class = per_class[top_k_indices]
+                per_box_pred_target, top_k_indices = \
+                    per_box_pred_target.topk(per_pre_nms_top_n, sorted=False)
                 per_box_regression = per_box_regression[top_k_indices]
                 per_locations = per_locations[top_k_indices]
-                if top_feat is not None:
-                    per_top_feat = per_top_feat[top_k_indices]
+
+                if target_list is not None:
+                    per_iou_trg = per_iou_trg[top_k_indices]
+                    per_reg_label = per_reg_label[top_k_indices]
 
             detections = torch.stack([
                 per_locations[:, 0] - per_box_regression[:, 0],
@@ -625,16 +693,50 @@ class DCROutputs(nn.Module):
                 per_locations[:, 1] + per_box_regression[:, 3],
             ], dim=1)
 
+            """
+            per_box_cls = per_box_cls[per_candidate_inds]
+            per_class = per_candidate_nonzeros[:, 1]
+            per_class = per_class[top_k_indices]
+            """
+
+            if target_list is not None:
+                detections = detections[per_reg_label != -1]
+                per_iou_trg = per_iou_trg[per_reg_label != -1]
+                per_box_cls = per_box_pred_target[per_reg_label != -1]
+                per_class = per_reg_label[per_reg_label != -1]
+                per_locations = per_locations[per_reg_label != -1]
+                per_reg_label = per_reg_label[per_reg_label != -1]
+            else:
+                from torchvision.ops import roi_align
+                roi = cat([torch.zeros((len(detections),1), device=detections.device),detections/4],dim=1)
+                roi[:,[0,2]] = roi[:,[0,2]].clamp(0, Wc)
+                roi[:,[1,3]] = roi[:,[1,3]].clamp(0, Hc)
+                per_box_cls = roi_align(per_cls_map, roi, output_size=1)
+
+                per_box_cls = per_box_cls.reshape(-1, self.num_classes)
+                per_candidate_inds = (per_box_cls > self.pre_nms_thresh)
+
+                if per_candidate_inds.sum().item() > per_pre_nms_top_n.item():
+                    cls_threshold = per_box_cls.flatten().topk(per_pre_nms_top_n,sorted=False)[0].min()
+                    per_candidate_inds = per_box_cls > cls_threshold
+
+                per_candidate_nonzeros = per_candidate_inds.nonzero()
+
+                per_box_cls = per_box_cls[per_candidate_inds]
+                per_box_loc = per_candidate_nonzeros[:,0]
+                per_class = per_candidate_nonzeros[:,1]
+                detections = detections[per_box_loc]
+                per_box_pred_target = per_box_pred_target[per_box_loc]
+                per_locations = per_locations[per_box_loc]
+                
             boxlist = Instances(image_sizes[i])
             boxlist.pred_boxes = Boxes(detections)
-            boxlist.scores = torch.sqrt(per_box_cls)
+            boxlist.scores = per_box_cls
             boxlist.pred_classes = per_class
             boxlist.locations = per_locations
-            if top_feat is not None:
-                boxlist.top_feat = per_top_feat
             results.append(boxlist)
 
-        return results
+        return results, analysis
 
     def select_over_all_levels(self, boxlists):
         num_images = len(boxlists)
