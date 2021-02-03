@@ -64,7 +64,7 @@ class DCROutputs(nn.Module):
         self.post_nms_topk_train = cfg.MODEL.DCR.POST_NMS_TOPK_TRAIN
         self.loc_loss_func = IOULoss(cfg.MODEL.DCR.LOC_LOSS_TYPE)
         self.iou_loss_func = nn.BCEWithLogitsLoss(reduction="sum")
-        self.disp_loss_func = nn.MSELoss(reduction="sum")
+        self.disp_loss_func = nn.SmoothL1Loss(reduction="sum")
 
         self.pre_nms_thresh_test = cfg.MODEL.DCR.INFERENCE_TH_TEST
         self.pre_nms_topk_test = cfg.MODEL.DCR.PRE_NMS_TOPK_TEST
@@ -661,6 +661,8 @@ class DCROutputs(nn.Module):
 
         else:
             reg_loss = reg_instances.pred_reg.sum() * 0
+        
+        assert((1 - reg_loss.item()) > 0)
 
         loss = {
             "loss_dcr_reg": reg_loss,
@@ -701,7 +703,7 @@ class DCROutputs(nn.Module):
 
         losses.update(self.dcr_cls_losses(instances["cls"], num_gpus))
         losses.update(self.dcr_reg_losses(instances["reg"], num_gpus))
-        #losses.update(self.dcr_disp_losses(instances["disp"], num_gpus))
+        losses.update(self.dcr_disp_losses(instances["disp"], num_gpus))
 
         return instances, losses
 

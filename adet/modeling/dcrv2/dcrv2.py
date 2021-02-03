@@ -242,7 +242,7 @@ class DCRHead(nn.Module):
                     if self.scales is not None:
                         reg = self.scales[k](reg)
 
-                    pred_reg.append(F.relu(reg))
+                    pred_reg.append(reg.exp())
                     pred_iou.append(iou)
                 elif 'DISP' == head:
                     disp = self.pred_disp(feature)
