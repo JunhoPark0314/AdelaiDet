@@ -662,11 +662,11 @@ class DCROutputs(nn.Module):
         else:
             reg_loss = reg_instances.pred_reg.sum() * 0
         
-        assert((1 - reg_loss.item()) > 0)
+        iou_weight = torch.max(1 - reg_loss.detach(), 0)[0]
 
         loss = {
             "loss_dcr_reg": reg_loss,
-            "loss_dcr_iou": iou_loss * (1 - reg_loss.detach()),
+            "loss_dcr_iou": iou_loss * iou_weight,
         }
 
         return loss
