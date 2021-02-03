@@ -41,7 +41,7 @@ class ModuleListDial(nn.ModuleList):
 
 
 @PROPOSAL_GENERATOR_REGISTRY.register()
-class DCR(nn.Module):
+class DCRv2(nn.Module):
     """
     Implement DCR (https://arxiv.org/abs/1904.01355).
     """
@@ -60,9 +60,9 @@ class DCR(nn.Module):
 
     def forward_head(self, features, top_module=None):
         features = [features[f] for f in self.in_features]
-        pred_class_logits, pred_deltas, pred_target = self.dcr_head(
+        pred_class_logits, pred_deltas, pred_target, pred_cls_ctr, pred_box_ctr = self.dcr_head(
             features, top_module, self.yield_proposal)
-        return pred_class_logits, pred_deltas, pred_target
+        return pred_class_logits, pred_deltas, pred_target, pred_cls_ctr,pred_box_ctr
 
     def forward(self, images, features, gt_instances=None, top_module=None):
         """
@@ -79,7 +79,7 @@ class DCR(nn.Module):
         """
         features = {f:features[f] for f in self.in_features}
         locations = self.compute_locations(features)
-        logits_pred, reg_pred, pred_target = self.dcr_head(features)
+        pred_result = self.dcr_head(features)
 
         results = {}
 
@@ -88,8 +88,7 @@ class DCR(nn.Module):
 
         if self.training:
             results, losses = self.dcr_outputs.losses(
-                logits_pred, reg_pred, pred_target,
-                locations, gt_instances
+                pred_result, locations, gt_instances, images.image_sizes
             )
             
             return results, losses
@@ -97,11 +96,10 @@ class DCR(nn.Module):
             cls_targets = None
             reg_targets = None
             if len(gt_instances[0]):
-                cls_targets, reg_targets = self.dcr_outputs._get_ground_truth(locations, gt_instances,
-                                                                    logits_pred, reg_pred, pred_target)
+                cls_targets, reg_targets = self.dcr_outputs._get_ground_truth(locations, gt_instances, pred_result)
             results, analysis = self.dcr_outputs.predict_proposals(
-                logits_pred, reg_pred, pred_target,
-                locations, images.image_sizes, training_target = {"cls": cls_targets, "reg": reg_targets} if cls_targets is not None else None
+                pred_result, locations, images.image_sizes, 
+                training_target = {"cls": cls_targets, "reg": reg_targets} if cls_targets is not None else None
             )
 
             return results, {}
@@ -173,7 +171,7 @@ class DCRHead(nn.Module):
             
             head_per_lvl[k] = nn.Sequential(*tower)
 
-        self.cls_logits = nn.Conv2d(
+        self.pred_cls = nn.Conv2d(
             in_channels, self.num_classes,
             kernel_size=3, stride=1,
             padding=1
@@ -182,9 +180,14 @@ class DCRHead(nn.Module):
             in_channels, 4, kernel_size=3,
             stride=1, padding=1
         )
-        self.target_anchor = nn.Conv2d(
+        self.pred_iou = nn.Conv2d(
             in_channels, 1, kernel_size=3,
             stride=1, padding=1
+        )
+        self.pred_disp = nn.Conv2d(
+            in_channels, 2,
+            kernel_size=3, stride=1,
+            padding=1
         )
 
         if cfg.MODEL.DCR.USE_SCALE:
@@ -197,8 +200,9 @@ class DCRHead(nn.Module):
         self.head_per_lvl = nn.ModuleDict(head_per_lvl)
 
         for modules in [
-            self.head_per_lvl, self.cls_logits,
-            self.bbox_pred, self.target_anchor
+            self.head_per_lvl,
+            self.pred_cls, self.pred_disp,
+            self.bbox_pred,  self.pred_iou, 
         ]:
             for l in modules.modules():
                 if isinstance(l, nn.Conv2d):
@@ -208,14 +212,20 @@ class DCRHead(nn.Module):
         # initialize the bias for focal loss
         prior_prob = cfg.MODEL.DCR.PRIOR_PROB
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        torch.nn.init.constant_(self.cls_logits.bias, bias_value)
-        torch.nn.init.constant_(self.target_anchor.bias, bias_value)
+        torch.nn.init.constant_(self.pred_cls.bias, bias_value)
+        torch.nn.init.constant_(self.pred_iou.bias, bias_value)
 
 
     def forward(self, x):
-        logits = []
-        bbox_reg = []
-        trg_anchor = []
+        # logits
+        pred_cls = []
+
+        # bbox pred & iou pred
+        pred_reg = []
+        pred_iou = []
+
+        # displacement vector
+        pred_disp = []
 
         for (k, feature), (_, cfg_per_lvl) in zip(x.items(), self.head_configs.items()):
 
@@ -223,16 +233,29 @@ class DCRHead(nn.Module):
             
             for head in cfg_per_lvl['HEAD']:
                 if 'CLS' == head:
-                    logits.append(self.cls_logits(feature))
+                    pred_cls.append(self.pred_cls(feature))
+
                 elif 'BBOX' == head:
                     reg = self.bbox_pred(feature)
+                    iou = self.pred_iou(feature)
 
                     if self.scales is not None:
                         reg = self.scales[k](reg)
-                    
-                    bbox_reg.append(reg.exp())
 
-                elif 'TRG' == head:
-                    trg_anchor.append(self.target_anchor(feature))
+                    pred_reg.append(reg.exp())
+                    pred_iou.append(iou)
+                elif 'DISP' == head:
+                    disp = self.pred_disp(feature)
+                    if self.scales is not None:
+                        disp = self.scales[k](disp)
 
-        return logits, bbox_reg, trg_anchor
+                    pred_disp.append(disp)
+
+        pred_result = {
+            "pred_cls": pred_cls,
+            "pred_reg": pred_reg,
+            "pred_iou": pred_iou,
+            "pred_disp": pred_disp,
+        }
+
+        return pred_result

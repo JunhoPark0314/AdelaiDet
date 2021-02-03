@@ -1,6 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from .fcos import FCOS
-from .dcrv1 import DCR
+from .dcrv1 import DCRv1
+from .dcrv2 import DCRv2
 from .blendmask import BlendMask
 from .backbone import build_fcos_resnet_fpn_backbone
 from .one_stage_detector import OneStageDetector, OneStageRCNN

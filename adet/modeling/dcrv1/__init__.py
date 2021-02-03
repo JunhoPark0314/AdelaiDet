@@ -1,1 +1,1 @@
-from .dcr import DCR
+from .dcrv1 import DCRv1
