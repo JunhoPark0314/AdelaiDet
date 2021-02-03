@@ -641,9 +641,12 @@ class DCROutputs(nn.Module):
             reg_instances.reg_weight /= reg_instances.reg_weight.mean()
 
         if reg_pos_inds.numel() + reg_neg_inds.numel() > 0:
-            iou_loss = self.iou_loss_func(
+            iou_loss = sigmoid_focal_loss_jit(
                 reg_instances.pred_iou[reg_pos_inds + reg_neg_inds],
                 reg_instances.iou_targets[reg_pos_inds + reg_neg_inds],
+                alpha=self.focal_loss_alpha,
+                gamma=self.focal_loss_gamma,
+                reduction="sum"
             ) / (num_reg_pos_avg + num_reg_neg_avg)
         else:
             iou_loss = reg_instances.pred_iou.sum() * 0
@@ -661,7 +664,7 @@ class DCROutputs(nn.Module):
 
         loss = {
             "loss_dcr_reg": reg_loss,
-            "loss_dcr_iou": iou_loss,
+            "loss_dcr_iou": iou_loss * (1 - reg_loss.detach()),
         }
 
         return loss
