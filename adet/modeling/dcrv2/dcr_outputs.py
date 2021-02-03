@@ -448,11 +448,11 @@ class DCROutputs(nn.Module):
 
             if self.instance_weight:
                 cls_weight_per_im = torch.ones(len(cls_targets_per_im), dtype=torch.float32, device=weights["cls"].device)
-                cls_weight_per_im[cls_pos_inds_per_im] += weights["cls"][cls_locations_to_gt_inds][cls_pos_inds_per_im]
+                cls_weight_per_im[cls_pos_inds_per_im != -1] += weights["cls"][cls_locations_to_gt_inds][cls_pos_inds_per_im != -1]
                 cls_training_target_per_im["weights"] = cls_weight_per_im
 
                 reg_weight_per_im = torch.ones(len(reg_targets_per_im), dtype=torch.float32, device=weights["reg"].device)
-                reg_weight_per_im[reg_pos_inds_per_im] += weights["reg"][reg_locations_to_gt_inds][reg_pos_inds_per_im]
+                reg_weight_per_im[reg_pos_inds_per_im != -1] += weights["reg"][reg_locations_to_gt_inds][reg_pos_inds_per_im != -1]
                 reg_training_target_per_im["weights"] = reg_weight_per_im
             
             cls_training_target.append(cls_training_target_per_im)
@@ -494,7 +494,7 @@ class DCROutputs(nn.Module):
         # push weight if instance weight is True
         if self.instance_weight:
             cls_instances.weight = cat([
-                x.reshape(-1) for x in training_target["weight"]
+                x.reshape(-1) for x in training_target["weights"]
             ])
 
         return cls_instances
@@ -530,9 +530,9 @@ class DCROutputs(nn.Module):
 
         # push weight if instance weight is True
         if self.instance_weight:
-            reg_instances.reg_weight = cat([
+            reg_instances.weight = cat([
                 # Reshape: (N, 1, Hi, Wi) -> (N*Hi*Wi,)
-                x.reshape(-1) for x in training_target["weight"]
+                x.reshape(-1) for x in training_target["weights"]
             ])
 
         return reg_instances
@@ -553,12 +553,6 @@ class DCROutputs(nn.Module):
         disp_instances.pred_disp = cat([
             x.permute(0, 2, 3, 1).reshape(-1, 2) for x in pred_result["pred_disp"]
         ], dim=0)
-
-        # push weight if instance weight is True
-        if self.instance_weight:
-            disp_instances.weight = cat([
-                x.reshape(-1) for x in training_target["weight"]
-            ])
 
         return disp_instances
 
@@ -633,12 +627,7 @@ class DCROutputs(nn.Module):
         num_reg_neg_avg= max(total_reg_num_neg / num_gpus, 1.0)
 
         if self.instance_weight:
-            # compute tp, fp, fn weight
-            tp = (reg_instances.box_logits.sigmoid() > self.pre_nms_thresh_test) * target_anchor
-            fp = (reg_instances.box_logits.sigmoid() > self.pre_nms_thresh_test) * (1 - target_anchor).bool()
-            reg_instances.target_weight[fp] += (1 - tp.sum() / (tp.sum() + fp.sum() + 1e-6))
-            reg_instances.target_weight /= reg_instances.target_weight.mean()
-            reg_instances.reg_weight /= reg_instances.reg_weight.mean()
+            reg_instances.weight /= reg_instances.weight.mean()
 
         if reg_pos_inds.numel() + reg_neg_inds.numel() > 0:
             iou_loss = sigmoid_focal_loss_jit(
@@ -656,7 +645,7 @@ class DCROutputs(nn.Module):
             reg_loss = self.loc_loss_func(
                 reg_instances.pred_reg[reg_pos_inds],
                 reg_instances.reg_targets[reg_pos_inds],
-                #weight=reg_instances.reg_weight.unsqueeze(1) if hasattr(reg_instances, "reg_weight") else None,
+                weight=reg_instances.reg_weight.unsqueeze(1) if hasattr(reg_instances, "reg_weight") else None,
             ) / num_reg_pos_avg
 
         else:
