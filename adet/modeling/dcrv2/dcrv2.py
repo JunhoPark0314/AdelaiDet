@@ -9,6 +9,7 @@ from detectron2.modeling.proposal_generator.build import PROPOSAL_GENERATOR_REGI
 
 from adet.layers import DFConv2d, NaiveGroupNorm
 from adet.utils.comm import compute_locations
+from detectron2.layers import cat
 from detectron2.utils.events import get_event_storage
 from .dcr_outputs import DCROutputs
 
@@ -58,6 +59,28 @@ class DCRv2(nn.Module):
         self.pos_sample_limit = cfg.MODEL.DCR.POS_SAMPLE_LIMIT
         self.max_iter = cfg.SOLVER.MAX_ITER
 
+    def iterate_disp(self, pred_disp):
+
+        num_it = int((torch.max(self.pos_sample_rate + 0.5, 0)[0]).item() // 0.2)
+
+        for i in range(num_it):
+            for l, disp_per_level in enumerate(pred_disp):
+                N, _, H, W  = disp_per_level.shape
+                location = cat([disp_per_level.new_ones(H, W).nonzero().reshape(1, H, W, 2)] * N).permute(0,3,1,2)
+                pred_cent = (location + disp_per_level).long()
+                # Need clamp here
+                pred_cent_flatten = pred_cent.permute(0,2,3,1).reshape(-1,2)
+                pred_cent_flatten[:,0] = pred_cent_flatten[:,0].clamp(0,H-1)
+                pred_cent_flatten[:,1] = pred_cent_flatten[:,1].clamp(0,W-1)
+
+                pred_cent_flatten = cat([torch.arange(N, device=pred_cent.device).reshape(-1,1).repeat(1,H*W).reshape(-1,1), pred_cent_flatten], dim=1)
+                assert torch.logical_and(pred_cent_flatten[:,1].max() < H, pred_cent_flatten[:,1].min() >= 0).item()
+                assert torch.logical_and(pred_cent_flatten[:,2].max() < W, pred_cent_flatten[:,2].min() >= 0).item()
+                inner_disp = disp_per_level[pred_cent_flatten[:,0], :, pred_cent_flatten[:,1], pred_cent_flatten[:,2]].reshape(N, H, W, 2).permute(0,3,1,2)
+                pred_disp[l] = inner_disp + disp_per_level
+
+        return pred_disp
+    
     def forward_head(self, features, top_module=None):
         features = [features[f] for f in self.in_features]
         pred_class_logits, pred_deltas, pred_target, pred_cls_ctr, pred_box_ctr = self.dcr_head(
@@ -80,6 +103,7 @@ class DCRv2(nn.Module):
         features = {f:features[f] for f in self.in_features}
         locations = self.compute_locations(features)
         pred_result = self.dcr_head(features)
+        pred_result["pred_disp"] = self.iterate_disp(pred_result["pred_disp"])
 
         results = {}
 
@@ -214,7 +238,6 @@ class DCRHead(nn.Module):
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         torch.nn.init.constant_(self.pred_cls.bias, bias_value)
         torch.nn.init.constant_(self.pred_iou.bias, bias_value)
-
 
     def forward(self, x):
         # logits
