@@ -141,17 +141,23 @@ class DCROutputs(nn.Module):
 
         # compute locations to size ranges
         loc_to_size_range = []
+        loc_to_stride = []
         for l, loc_per_level in enumerate(locations):
             loc_to_size_range_per_level = loc_per_level.new_tensor(self.sizes_of_interest[l])
             loc_to_size_range.append(
                 loc_to_size_range_per_level[None].expand(num_loc_list[l], -1)
             )
+            loc_to_stride_per_level = loc_per_level.new_tensor(self.strides[l])
+            loc_to_stride.append(
+                loc_to_stride_per_level[None].expand(num_loc_list[l],-1)
+            )
 
         loc_to_size_range = torch.cat(loc_to_size_range, dim=0)
+        loc_to_stride = torch.cat(loc_to_stride,dim=0)
         locations = torch.cat(locations, dim=0)
 
         training_target = self.compute_DCR_for_locations(
-            locations, gt_instances, loc_to_size_range, num_loc_list, pred_result, image_size
+            locations, gt_instances, loc_to_size_range, loc_to_stride, num_loc_list, pred_result, image_size
         )
 
         # transpose im first training_targets to level first ones
@@ -275,10 +281,10 @@ class DCROutputs(nn.Module):
 
     @torch.no_grad()
     def get_threshold_region(
-        self, is_in_boxes, pred_result, num_loc_list, targets_per_im, locations, image_size
+        self, is_in_boxes, is_in_boxes_surrond, pred_result, targets_per_im, locations, image_size
     ):
         reg_in_boxes = copy.deepcopy(is_in_boxes)
-        reg_neg_boxes = copy.deepcopy(is_in_boxes)
+        reg_neg_boxes = copy.deepcopy(is_in_boxes_surrond)
         cls_in_boxes = copy.deepcopy(is_in_boxes)
         # prepare prediction per grid
 
@@ -317,7 +323,6 @@ class DCROutputs(nn.Module):
             "cls": cls_in_boxes,
             "reg": reg_in_boxes,
             "reg_neg": reg_neg_boxes,
-            "disp": is_in_boxes,
         }
         weight = {
             "cls": cls_weight,
@@ -347,7 +352,7 @@ class DCROutputs(nn.Module):
         }
         return target
 
-    def compute_DCR_for_locations(self, locations, targets, size_ranges, num_loc_list, pred_result, image_size):
+    def compute_DCR_for_locations(self, locations, targets, size_ranges, loc_to_strides, num_loc_list, pred_result, image_size):
 
         cls_training_target = []
         reg_training_target = []
@@ -379,13 +384,15 @@ class DCROutputs(nn.Module):
             b = bboxes[:, 3][None] - ys[:, None]
             reg_targets_per_im = torch.stack([l, t, r, b], dim=2)
 
+
+            is_in_boxes_surrond = (reg_targets_per_im.min(dim=2)[0] + loc_to_strides > 0)
             is_in_boxes_pure = (reg_targets_per_im.min(dim=2)[0] > 0)
 
             # limit the regression range for each location
             max_reg_targets_per_im = reg_targets_per_im.max(dim=2)[0]
             is_cared_in_the_level = \
-                (max_reg_targets_per_im[-len(size_ranges):] >= size_ranges[:, [0]]) & \
-                (max_reg_targets_per_im[-len(size_ranges):] <= size_ranges[:, [1]])
+                (max_reg_targets_per_im >= size_ranges[:, [0]]) & \
+                (max_reg_targets_per_im <= size_ranges[:, [1]])
 
             pred_per_im = {
                 "pred_cls": cat([x[im_i].permute(1,2,0).reshape(-1, self.num_classes) for x in pred_result["pred_cls"]]),
@@ -405,8 +412,8 @@ class DCROutputs(nn.Module):
 
                 is_in_boxes, weights  = self.get_threshold_region(
                     is_in_boxes_pure * is_cared_in_the_level, 
+                    is_in_boxes_surrond * is_cared_in_the_level,
                     pred_per_im,
-                    num_loc_list, 
                     targets_per_im, 
                     locations,
                     image_size_per_im
@@ -432,7 +439,7 @@ class DCROutputs(nn.Module):
 
             cls_locations_to_min_area, cls_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["cls"], is_cared_in_the_level)
             reg_locations_to_min_area, reg_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["reg"], is_cared_in_the_level)
-            disp_locations_to_min_area, disp_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["disp"], is_cared_in_the_level)
+            disp_locations_to_min_area, disp_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes_surrond, is_cared_in_the_level)
 
             # compute pos inds
             cls_pos_inds_per_im = compute_pos_inds(cls_locations_to_gt_inds, cls_locations_to_min_area, num_target)
