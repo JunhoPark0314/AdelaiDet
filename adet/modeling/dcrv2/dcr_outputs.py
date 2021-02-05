@@ -270,7 +270,7 @@ class DCROutputs(nn.Module):
             iou_std = 0.0
         
         reg_pos_per_target = (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
-        reg_neg_per_target = (iou_per_target <= iou_mean - iou_std * self.pos_sample_rate).squeeze(0)
+        reg_neg_per_target = (iou_per_target < iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
 
         if self.instance_weight:
             iou_dump = iou_per_target.squeeze(0)[reg_in_boxes]
