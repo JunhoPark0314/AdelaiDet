@@ -89,7 +89,8 @@ class DCROutputs(nn.Module):
 
     def iterate_disp(self, pred_disp):
 
-        num_it = int((max(self.pos_sample_rate + 0.5, 0)) // 0.2)
+        #num_it = int((max(self.pos_sample_rate + 0.5, 0)) // 0.2)
+        num_it = 4
         num_touch = [x.new_ones(x.shape[0],x.shape[2], x.shape[3]).long() for x in pred_disp]
         result_cent = [x.new_ones(x.shape[0], 3,x.shape[2], x.shape[3]).long() for x in pred_disp]
 

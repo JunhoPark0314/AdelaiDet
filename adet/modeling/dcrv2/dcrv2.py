@@ -110,7 +110,7 @@ class DCRv2(nn.Module):
         features = {f:features[f] for f in self.in_features}
         locations = self.compute_locations(features)
         pred_result = self.dcr_head(features)
-        pred_result["pred_disp"], num_touch = self.iterate_disp(pred_result["pred_disp"])
+        #pred_result["pred_disp"], num_touch = self.iterate_disp(pred_result["pred_disp"])
 
         results = {}
 
