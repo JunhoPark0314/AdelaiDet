@@ -4,6 +4,7 @@ from detectron2.structures.boxes import matched_boxlist_iou
 import torch
 from torch import nn
 import torch.nn.functional as F
+import copy
 
 from detectron2.layers import cat
 from detectron2.structures import Instances, Boxes
@@ -86,6 +87,37 @@ class DCROutputs(nn.Module):
         soi.append([prev_size, INF])
         self.sizes_of_interest = soi
 
+    def iterate_disp(self, pred_disp):
+
+        num_it = int((max(self.pos_sample_rate + 0.5, 0)) // 0.2)
+        num_touch = [x.new_ones(x.shape[0],x.shape[2], x.shape[3]).long() for x in pred_disp]
+        result_cent = [x.new_ones(x.shape[0], 3,x.shape[2], x.shape[3]).long() for x in pred_disp]
+
+        for i in range(num_it):
+            for l, (disp_per_level, num_touch_per_level) in enumerate(zip(pred_disp, num_touch)):
+                N, _, H, W  = disp_per_level.shape
+                location = cat([disp_per_level.new_ones(H, W).nonzero().reshape(1, H, W, 2)] * N).permute(0,3,1,2)
+                pred_cent = (location + disp_per_level).long()
+                # Need clamp here
+                pred_cent[:,0,:,:] = pred_cent[:,0].clamp(0,H-1)
+                pred_cent[:,1,:,:] = pred_cent[:,1].clamp(0,W-1)
+                pred_cent = cat([torch.arange(N, device=pred_cent.device).reshape(-1,1).repeat(1,H*W).reshape(N,1,H,W), pred_cent], dim=1)
+
+                pred_cent_flatten = pred_cent.permute(0,2,3,1).reshape(-1,3)
+                assert torch.logical_and(pred_cent_flatten[:,1].max() < H, pred_cent_flatten[:,1].min() >= 0).item()
+                assert torch.logical_and(pred_cent_flatten[:,2].max() < W, pred_cent_flatten[:,2].min() >= 0).item()
+
+                unique_pred_cent, pred_count = pred_cent_flatten.unique(dim=0, return_counts=True)
+                new_touch = torch.zeros_like(num_touch_per_level)
+                new_touch[unique_pred_cent[:,0],unique_pred_cent[:,1], unique_pred_cent[:,2]] = pred_count
+
+                inner_disp = disp_per_level[pred_cent_flatten[:,0], :, pred_cent_flatten[:,1], pred_cent_flatten[:,2]].reshape(N, H, W, 2).permute(0,3,1,2)
+                pred_disp[l] = inner_disp + disp_per_level
+                num_touch[l] = new_touch
+                result_cent[l] = pred_cent
+
+        return pred_disp, num_touch, result_cent
+
     def _transpose(self, training_targets, num_loc_list):
         '''
         This function is used to transpose image first training targets to level first ones
@@ -142,6 +174,7 @@ class DCROutputs(nn.Module):
         for l in range(len(reg_targets)):
             reg_targets[l] = reg_targets[l] / float(self.strides[l])
             disp_targets[l] = disp_targets[l] / float(self.strides[l])
+            disp_targets[l] = disp_targets[l].clamp(-1,1)
 
             # change ctr vector to angle and length 
             #disp_targets[l] = get_angle(disp_targets[l], float(self.strides[l]))
@@ -230,22 +263,23 @@ class DCROutputs(nn.Module):
             iou_std = 0.0
         
         reg_pos_per_target = (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+        reg_neg_per_target = (iou_per_target <= iou_mean - iou_std * self.pos_sample_rate).squeeze(0)
 
         if self.instance_weight:
             iou_dump = iou_per_target.squeeze(0)[reg_in_boxes]
             iou_iw_recall = ((iou_dump > 0.5).sum() / (len(iou_dump) + 1e-6))
             reg_weight = 1 - iou_iw_recall
 
-        return reg_pos_per_target, reg_weight
+        return reg_pos_per_target, reg_neg_per_target, reg_weight
 
 
     @torch.no_grad()
     def get_threshold_region(
         self, is_in_boxes, pred_result, num_loc_list, targets_per_im, locations, image_size
     ):
-        reg_in_boxes = is_in_boxes.detach()
-        cls_in_boxes = is_in_boxes.detach()
-        
+        reg_in_boxes = copy.deepcopy(is_in_boxes)
+        reg_neg_boxes = copy.deepcopy(is_in_boxes)
+        cls_in_boxes = copy.deepcopy(is_in_boxes)
         # prepare prediction per grid
 
         pred_box = cat([locations - pred_result["pred_reg"][:,:2] , locations + pred_result["pred_reg"][:,2:]], dim=1)
@@ -264,8 +298,9 @@ class DCROutputs(nn.Module):
             cls_pos_per_target, cls_weight_per_target = self.per_target_cls_threshold_region(pred_result["pred_cls"], target_dict, cls_in_boxes[:,l])
             cls_in_boxes[:,l] *= cls_pos_per_target
 
-            reg_pos_per_target, reg_weight_per_target = self.per_target_reg_threshold_region(pred_box, target_dict, reg_in_boxes[:,l])
+            reg_pos_per_target, reg_neg_per_target, reg_weight_per_target = self.per_target_reg_threshold_region(pred_box, target_dict, reg_in_boxes[:,l])
             reg_in_boxes[:,l] *= reg_pos_per_target
+            reg_neg_boxes[:,l] *= (reg_neg_per_target)
 
             if self.instance_weight:
                 cls_weight.append(cls_weight_per_target)
@@ -281,6 +316,7 @@ class DCROutputs(nn.Module):
         in_boxes = {
             "cls": cls_in_boxes,
             "reg": reg_in_boxes,
+            "reg_neg": reg_neg_boxes,
             "disp": is_in_boxes,
         }
         weight = {
@@ -396,14 +432,13 @@ class DCROutputs(nn.Module):
 
             cls_locations_to_min_area, cls_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["cls"], is_cared_in_the_level)
             reg_locations_to_min_area, reg_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["reg"], is_cared_in_the_level)
-            reg_neg_to_min_area, reg_neg_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes_pure, is_cared_in_the_level)
             disp_locations_to_min_area, disp_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["disp"], is_cared_in_the_level)
 
             # compute pos inds
             cls_pos_inds_per_im = compute_pos_inds(cls_locations_to_gt_inds, cls_locations_to_min_area, num_target)
             reg_pos_inds_per_im = compute_pos_inds(reg_locations_to_gt_inds, reg_locations_to_min_area, num_target)
-            reg_neg_inds_per_im = compute_pos_inds(reg_neg_to_gt_inds, reg_neg_to_min_area, num_target)
-            reg_neg_inds_per_im[reg_pos_inds_per_im != -1] = -1
+            reg_neg_inds_per_im = is_in_boxes["reg_neg"].sum(dim=1).bool()
+            reg_neg_inds_per_im[reg_pos_inds_per_im != -1] = False
             disp_pos_inds_per_im = compute_pos_inds(disp_locations_to_gt_inds, disp_locations_to_min_area, num_target)
 
             def compute_iou(target, pred, locations, image_size):
@@ -423,7 +458,6 @@ class DCROutputs(nn.Module):
             iou_targets_per_im = compute_iou(reg_targets_per_im, pred_per_im["pred_reg"], locations, image_size_per_im)
             disp_targets_per_im = locations - disp_targets_per_im[disp_locations_to_gt_inds]
             disp_targets_per_im[disp_locations_to_min_area == INF] = 0
-
 
             reg_label_per_im = -torch.ones_like(reg_pos_inds_per_im, device=reg_pos_inds_per_im.device).long()
             reg_label_per_im[reg_pos_inds_per_im] = targets_per_im.gt_classes[reg_locations_to_gt_inds[reg_pos_inds_per_im]]
@@ -621,7 +655,7 @@ class DCROutputs(nn.Module):
         total_reg_num_pos = reduce_sum(num_reg_pos_local).item()
         num_reg_pos_avg = max(total_reg_num_pos / num_gpus, 1.0)
 
-        reg_neg_inds = reg_instances.neg_inds != -1
+        reg_neg_inds = reg_instances.neg_inds
         num_reg_neg_local = reg_neg_inds.sum()
         total_reg_num_neg = reduce_sum(num_reg_neg_local).item()
         num_reg_neg_avg= max(total_reg_num_neg / num_gpus, 1.0)
@@ -651,11 +685,12 @@ class DCROutputs(nn.Module):
         else:
             reg_loss = reg_instances.pred_reg.sum() * 0
         
-        iou_weight = torch.max(1 - reg_loss.detach(), 0)[0]
+        #iou_weight = torch.max(1 - reg_loss.detach(), 0)[0]
 
         loss = {
             "loss_dcr_reg": reg_loss,
-            "loss_dcr_iou": iou_loss * iou_weight,
+            #"loss_dcr_iou": iou_loss * iou_weight,
+            "loss_dcr_iou": iou_loss ,
         }
 
         return loss
@@ -697,8 +732,7 @@ class DCROutputs(nn.Module):
         return instances, losses
 
     def predict_proposals(
-            self, logits_pred, reg_pred, box_logits,
-            locations, image_sizes, training_target=None
+            self, pred_result, locations, image_sizes, training_target=None
     ):
         if self.training:
             self.pre_nms_thresh = self.pre_nms_thresh_train
@@ -715,52 +749,44 @@ class DCROutputs(nn.Module):
         pt_analysis = []
 
         bundle = {
-            "l": locations,
-            "r": reg_pred, "t": box_logits,
-            "s": self.strides, 
+            "locations": locations,
+            "strides": self.strides
         }
+        bundle.update(pred_result)
 
         if training_target is not None:
-            reg_target = training_target["reg"]["reg_targets"]
-            pt_target = training_target["reg"]["pos_inds"]
-            reg_label = training_target["reg"]["reg_label"]
 
-            bundle["rt"] = reg_target
-            bundle["pt"] = pt_target
-            bundle["rl"] = reg_label
+            bundle["reg_target"] = training_target["reg"]["targets"]
+            bundle["cls_target"] = training_target["cls"]["targets"]
+            bundle["disp_target"] = training_target["disp"]["targets"]
+            bundle["reg_label"] = training_target["reg"]["labels"]
+            bundle["cls_pos_inds"] = training_target["cls"]["pos_inds"]
+            bundle["reg_pos_inds"] = training_target["reg"]["pos_inds"]
+            bundle["reg_neg_inds"] = training_target["reg"]["neg_inds"]
 
         for i, per_bundle in enumerate(zip(*bundle.values())):
             # get per-level bundle
             per_bundle = dict(zip(bundle.keys(), per_bundle))
             # recall that during training, we normalize regression targets with FPN's stride.
             # we denormalize them here.
-            l = per_bundle["l"]
-            o = logits_pred[0]
-            r = per_bundle["r"] * per_bundle["s"]
-            t = per_bundle["t"] 
-            targets = None
-
-            if training_target is not None:
-                rt = per_bundle["rt"] * per_bundle["s"]
-                pt = per_bundle["pt"]
-                rl = per_bundle["rl"]
-                targets = [training_target["cls"], rt, pt, rl] if i == 0  else [None, rt, pt, rl]
 
             boxes, analysis = self.forward_for_single_feature_map(
-                l, o, r, t, image_sizes, targets
+                per_bundle, image_sizes
             )
-            sampled_boxes.append(boxes)
-            if "cls" in analysis:
-                cls_analysis.append(analysis["cls"])
-            if "reg" in analysis:
-                reg_analysis.append(analysis["reg"])
-            if "pt" in analysis:
-                pt_analysis.append(analysis["pt"])
+            if len(boxes):
+                sampled_boxes.append(boxes)
 
-            for per_im_sampled_boxes in sampled_boxes[-1]:
-                per_im_sampled_boxes.fpn_levels = l.new_ones(
-                    len(per_im_sampled_boxes), dtype=torch.long
-                ) * i
+                if "cls" in analysis:
+                    cls_analysis.append(analysis["cls"])
+                if "reg" in analysis:
+                    reg_analysis.append(analysis["reg"])
+                if "pt" in analysis:
+                    pt_analysis.append(analysis["pt"])
+
+                for per_im_sampled_boxes in sampled_boxes[-1]:
+                    per_im_sampled_boxes.fpn_levels = per_bundle["locations"].new_ones(
+                        len(per_im_sampled_boxes), dtype=torch.long
+                    ) * i
 
         boxlists = list(zip(*sampled_boxes))
         boxlists = [Instances.cat(boxlist) for boxlist in boxlists]
@@ -778,144 +804,77 @@ class DCROutputs(nn.Module):
         return tp.sum(), fn.sum(), fp.sum(), jid
 
     def forward_for_single_feature_map(
-            self, locations, logits_pred, reg_pred,
-            box_logits, image_sizes, target_list=None
+            self, bundle, image_sizes
     ):
 
         results = []
         analysis = defaultdict(list)
 
-        N, C, Hc, Wc = logits_pred.shape
+        N, C, H, W = bundle["pred_cls"].shape
 
         # put in the same format as locations
 
-        cls_map = logits_pred
-        logits_pred = logits_pred.view(N, C, Hc, Wc).permute(0, 2, 3, 1)
-        logits_pred = logits_pred.reshape(N, -1, C).sigmoid()
+        pred_cls = bundle["pred_cls"].view(N, C, H, W).permute(0, 2, 3, 1)
+        pred_cls = pred_cls.reshape(N, -1, C).sigmoid()
 
-        _, _, H, W = reg_pred.shape
+        pred_reg = bundle["pred_reg"].view(N, 4, H, W).permute(0, 2, 3, 1) * bundle["strides"]
+        pred_reg = pred_reg.reshape(N, -1, 4)
 
-        box_regression = reg_pred.view(N, 4, H, W).permute(0, 2, 3, 1)
-        box_regression = box_regression.reshape(N, -1, 4)
-        box_logits = box_logits.view(N, 1, H, W).permute(0, 2, 3, 1)
-        box_logits = box_logits.reshape(N, -1).sigmoid()
+        pred_iou = bundle["pred_iou"].view(N, 1, H, W).permute(0, 2, 3, 1)
+        pred_iou = pred_iou.reshape(N, -1).sigmoid()
+
+        pred_disp = bundle["pred_disp"].view(N, 2, H, W)
+        location = bundle["locations"]
+
+        _, num_touch, pred_cent = self.iterate_disp([pred_disp])
+
+        box_pred = cat([location - pred_reg[0,:,:2], location + pred_reg[0,:,2:]], dim=1)
 
         # calculate true positive, false positive, false negative of prediction
-        if target_list is not None:
-            cls_trg, reg_trg, pt_trg, reg_label = target_list
-            if cls_trg is not None:
-                true_label = cls_trg["labels"][0]
-                label_pos = cls_trg["pos_inds"][0]
+        if "cls_target" in bundle:
+            cls_target = bundle["cls_target"]
+            cls_pos_inds = bundle["cls_pos_inds"] != -1
+            reg_target = bundle["reg_target"] * bundle["strides"]
+            reg_pos_inds = bundle["reg_pos_inds"] != -1
+            reg_neg_inds = bundle["reg_neg_inds"] != -1
+            disp_target = bundle["disp_target"]
 
-                true = torch.zeros_like(logits_pred).bool()
-                true[:,label_pos,true_label[label_pos]] = 1
-                analysis["cls"].append(self.calc_stat(true, logits_pred > self.pre_nms_thresh))
+            disp_target = disp_target.reshape(N, H, W, 2).permute(0,3,1,2)
 
-            reg_trg = cat([locations - reg_trg[:,:2], locations + reg_trg[:,2:]],dim=1)
-            box_pred = cat([locations - box_regression[0,:,:2], locations + box_regression[0,:,2:]], dim=1)
+            true = torch.zeros_like(pred_cls).bool()
+            true[:,cls_pos_inds,cls_target[cls_pos_inds]] = 1
+            analysis["cls"].append(self.calc_stat(true, pred_cls > self.pre_nms_thresh))
+
+            reg_trg = cat([location - reg_target[:,:2], location + reg_target[:,2:]],dim=1)
             reg_trg[reg_trg < 0] = 0
             box_pred[box_pred < 0] = 0
             iou_trg = matched_boxlist_iou(Boxes(reg_trg), Boxes(box_pred))
-            iou_trg[~pt_trg] = 0
+            analysis["pt"].append(self.calc_stat(reg_pos_inds, pred_iou > self.pre_nms_thresh))
 
-            #analysis["reg"].append([self.calc_stat(iou_trg > 0.5, box_logits[0] > self.pre_nms_thresh)])
-            analysis["pt"].append(self.calc_stat(pt_trg, box_logits[0] > self.pre_nms_thresh))
-            #iou_trg[pt_trg]
+            _, gt_touch, pred_cent = self.iterate_disp([disp_target])
 
-        # if self.thresh_with_ctr is True, we multiply the classification
-        # scores with centerness scores before applying the threshold.
-
-        if target_list is not None:
-            candidate_inds = iou_trg.unsqueeze(0) > self.pre_nms_thresh
+        if "cls_target" in bundle:
+            candidate_inds = (gt_touch[0] > 1).nonzero()
             #candidate_inds = box_logits > self.pre_nms_thresh
         else:
-            candidate_inds = box_logits > self.pre_nms_thresh
-        pre_nms_top_n = candidate_inds.reshape(N, -1).sum(1)
-        pre_nms_top_n = pre_nms_top_n.clamp(max=self.pre_nms_topk)
+            candidate_inds = (num_touch[0] > 1).nonzero()
+            iou_trg = pred_iou[0]
 
-        """
-        candidate_inds = logits_pred > self.pre_nms_thresh
-        pre_nms_top_n = candidate_inds.reshape(N, -1).sum(1)
-        pre_nms_top_n = pre_nms_top_n.clamp(max=self.pre_nms_topk)
-        """
+        if len(candidate_inds):
+            dist = ((pred_cent[0].permute(0,2,3,1).reshape(-1,1,3) - candidate_inds) ** 2)
+            candidate_inds = (-dist.sum(dim=2)).topk(30,dim=0)[1]
+            iou_trg, reg_idx = iou_trg[candidate_inds].max(dim=0)
+            box_pred = box_pred[candidate_inds][reg_idx,torch.arange(len(reg_idx)),:]
+            per_box_cls, per_class = pred_cls[:,candidate_inds,:].max(dim=1)[0].max(dim=-1)
+            per_locations = location[candidate_inds][reg_idx, torch.arange(len(reg_idx)), :]
 
-        for i in range(N):
-            per_cls_map = cls_map.sigmoid()
-            per_box_regression = box_regression[i]
-            per_box_box_logits = box_logits[i]
-            per_candidate_inds = candidate_inds[i]
-            per_pre_nms_top_n = pre_nms_top_n[i]
-
-            per_candidate_nonzeros = per_candidate_inds.nonzero()
-            per_box_loc = per_candidate_nonzeros[:, 0]
-            per_box_regression = per_box_regression[per_box_loc]
-            per_box_box_logits = per_box_box_logits[per_box_loc]
-            per_locations = locations[per_box_loc]
-
-            if target_list is not None:
-                per_reg_label = reg_label
-                per_reg_label = per_reg_label[per_box_loc]
-                per_iou_trg = iou_trg[per_box_loc]
-
-            if per_candidate_inds.sum().item() > per_pre_nms_top_n.item():
-                per_box_box_logits, top_k_indices = \
-                    per_box_box_logits.topk(per_pre_nms_top_n, sorted=False)
-                per_box_regression = per_box_regression[top_k_indices]
-                per_locations = per_locations[top_k_indices]
-
-                if target_list is not None:
-                    per_iou_trg = per_iou_trg[top_k_indices]
-                    per_reg_label = per_reg_label[top_k_indices]
-
-            detections = torch.stack([
-                per_locations[:, 0] - per_box_regression[:, 0],
-                per_locations[:, 1] - per_box_regression[:, 1],
-                per_locations[:, 0] + per_box_regression[:, 2],
-                per_locations[:, 1] + per_box_regression[:, 3],
-            ], dim=1)
-
-            """
-            per_box_cls = per_box_cls[per_candidate_inds]
-            per_class = per_candidate_nonzeros[:, 1]
-            per_class = per_class[top_k_indices]
-            """
-
-            if target_list is not None and False:
-                detections = detections[per_reg_label != -1]
-                per_iou_trg = per_iou_trg[per_reg_label != -1]
-                per_box_cls = per_box_box_logits[per_reg_label != -1]
-                per_class = per_reg_label[per_reg_label != -1]
-                per_locations = per_locations[per_reg_label != -1]
-                per_reg_label = per_reg_label[per_reg_label != -1]
-            else:
-                from torchvision.ops import roi_align
-                roi = cat([torch.zeros((len(detections),1), device=detections.device),detections/4],dim=1)
-                roi[:,[0,2]] = roi[:,[0,2]].clamp(0, Wc)
-                roi[:,[1,3]] = roi[:,[1,3]].clamp(0, Hc)
-                per_box_cls = roi_align(per_cls_map, roi, output_size=1)
-
-                per_box_cls = per_box_cls.reshape(-1, self.num_classes)
-                per_candidate_inds = (per_box_cls > self.pre_nms_thresh)
-
-                if per_candidate_inds.sum().item() > per_pre_nms_top_n.item():
-                    cls_threshold = per_box_cls.flatten().topk(per_pre_nms_top_n,sorted=False)[0].min()
-                    per_candidate_inds = per_box_cls > cls_threshold
-
-                per_candidate_nonzeros = per_candidate_inds.nonzero()
-
-                per_box_cls = per_box_cls[per_candidate_inds]
-                per_box_loc = per_candidate_nonzeros[:,0]
-                per_class = per_candidate_nonzeros[:,1]
-                detections = detections[per_box_loc]
-                per_box_box_logits = per_box_box_logits[per_box_loc]
-                per_locations = per_locations[per_box_loc]
-                
-            boxlist = Instances(image_sizes[i])
-            boxlist.pred_boxes = Boxes(detections)
-            boxlist.scores = per_box_cls
-            boxlist.pred_classes = per_class
-            boxlist.locations = per_locations
-            results.append(boxlist)
+            for i in range(N):
+                boxlist = Instances(image_sizes[i])
+                boxlist.pred_boxes = Boxes(box_pred)
+                boxlist.scores = per_box_cls[i]
+                boxlist.pred_classes = per_class[i]
+                boxlist.locations = per_locations
+                results.append(boxlist)
 
         return results, analysis
 

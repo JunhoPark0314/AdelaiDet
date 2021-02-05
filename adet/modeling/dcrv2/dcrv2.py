@@ -62,9 +62,10 @@ class DCRv2(nn.Module):
     def iterate_disp(self, pred_disp):
 
         num_it = int((torch.max(self.pos_sample_rate + 0.5, 0)[0]).item() // 0.2)
+        num_touch = [x.new_ones(x.shape[0],x.shape[2], x.shape[3]).long() for x in pred_disp]
 
         for i in range(num_it):
-            for l, disp_per_level in enumerate(pred_disp):
+            for l, (disp_per_level, num_touch_per_level) in enumerate(zip(pred_disp, num_touch)):
                 N, _, H, W  = disp_per_level.shape
                 location = cat([disp_per_level.new_ones(H, W).nonzero().reshape(1, H, W, 2)] * N).permute(0,3,1,2)
                 pred_cent = (location + disp_per_level).long()
@@ -72,14 +73,20 @@ class DCRv2(nn.Module):
                 pred_cent_flatten = pred_cent.permute(0,2,3,1).reshape(-1,2)
                 pred_cent_flatten[:,0] = pred_cent_flatten[:,0].clamp(0,H-1)
                 pred_cent_flatten[:,1] = pred_cent_flatten[:,1].clamp(0,W-1)
-
                 pred_cent_flatten = cat([torch.arange(N, device=pred_cent.device).reshape(-1,1).repeat(1,H*W).reshape(-1,1), pred_cent_flatten], dim=1)
+
                 assert torch.logical_and(pred_cent_flatten[:,1].max() < H, pred_cent_flatten[:,1].min() >= 0).item()
                 assert torch.logical_and(pred_cent_flatten[:,2].max() < W, pred_cent_flatten[:,2].min() >= 0).item()
+
+                unique_pred_cent, pred_count = pred_cent_flatten.unique(dim=0, return_counts=True)
+                new_touch = torch.zeros_like(num_touch_per_level)
+                new_touch[unique_pred_cent[:,0],unique_pred_cent[:,1], unique_pred_cent[:,2]] = pred_count
+
                 inner_disp = disp_per_level[pred_cent_flatten[:,0], :, pred_cent_flatten[:,1], pred_cent_flatten[:,2]].reshape(N, H, W, 2).permute(0,3,1,2)
                 pred_disp[l] = inner_disp + disp_per_level
+                num_touch[l] = new_touch
 
-        return pred_disp
+        return pred_disp, num_touch
     
     def forward_head(self, features, top_module=None):
         features = [features[f] for f in self.in_features]
@@ -103,7 +110,7 @@ class DCRv2(nn.Module):
         features = {f:features[f] for f in self.in_features}
         locations = self.compute_locations(features)
         pred_result = self.dcr_head(features)
-        pred_result["pred_disp"] = self.iterate_disp(pred_result["pred_disp"])
+        pred_result["pred_disp"], num_touch = self.iterate_disp(pred_result["pred_disp"])
 
         results = {}
 
@@ -117,13 +124,13 @@ class DCRv2(nn.Module):
             
             return results, losses
         else:
-            cls_targets = None
-            reg_targets = None
+            pred_result["num_touch"] = num_touch
+            training_target = None
             if len(gt_instances[0]):
-                cls_targets, reg_targets = self.dcr_outputs._get_ground_truth(locations, gt_instances, pred_result)
+                training_target = self.dcr_outputs._get_ground_truth(locations, gt_instances, pred_result, images.image_sizes)
             results, analysis = self.dcr_outputs.predict_proposals(
                 pred_result, locations, images.image_sizes, 
-                training_target = {"cls": cls_targets, "reg": reg_targets} if cls_targets is not None else None
+                training_target = training_target if training_target is not None else None
             )
 
             return results, {}
@@ -269,10 +276,10 @@ class DCRHead(nn.Module):
                     pred_iou.append(iou)
                 elif 'DISP' == head:
                     disp = self.pred_disp(feature)
-                    if self.scales is not None:
-                        disp = self.scales[k](disp)
+                    #if self.scales is not None:
+                    #    disp = self.scales[k](disp)
 
-                    pred_disp.append(disp)
+                    pred_disp.append(disp.tanh())
 
         pred_result = {
             "pred_cls": pred_cls,
