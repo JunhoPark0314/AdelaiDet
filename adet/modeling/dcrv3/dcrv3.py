@@ -42,7 +42,7 @@ class ModuleListDial(nn.ModuleList):
 
 
 @PROPOSAL_GENERATOR_REGISTRY.register()
-class DCRv2(nn.Module):
+class DCRv3(nn.Module):
     """
     Implement DCR (https://arxiv.org/abs/1904.01355).
     """

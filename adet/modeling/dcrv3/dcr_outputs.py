@@ -389,6 +389,7 @@ class DCROutputs(nn.Module):
 
             is_in_boxes_surrond = (reg_targets_per_im.min(dim=2)[0] + loc_to_strides > 0)
             is_in_boxes_pure = (reg_targets_per_im.min(dim=2)[0] > 0)
+            
 
             # limit the regression range for each location
             max_reg_targets_per_im = reg_targets_per_im.max(dim=2)[0]
@@ -673,12 +674,10 @@ class DCROutputs(nn.Module):
             reg_instances.weight /= reg_instances.weight.mean()
 
         if reg_pos_inds.numel() + reg_neg_inds.numel() > 0:
-            iou_loss = sigmoid_focal_loss_jit(
+
+            iou_loss = self.iou_loss_func(
                 reg_instances.pred_iou[reg_pos_inds + reg_neg_inds],
                 reg_instances.iou_targets[reg_pos_inds + reg_neg_inds],
-                alpha=self.focal_loss_alpha,
-                gamma=self.focal_loss_gamma,
-                reduction="sum"
             ) / (num_reg_pos_avg + num_reg_neg_avg)
         else:
             iou_loss = reg_instances.pred_iou.sum() * 0
@@ -694,12 +693,12 @@ class DCROutputs(nn.Module):
         else:
             reg_loss = reg_instances.pred_reg.sum() * 0
         
-        #iou_weight = torch.max(1 - reg_loss.detach(), 0)[0]
+        iou_weight = torch.max(1 - reg_loss.detach(), 0)[0]
 
         loss = {
             "loss_dcr_reg": reg_loss,
-            #"loss_dcr_iou": iou_loss * iou_weight,
-            "loss_dcr_iou": iou_loss ,
+            "loss_dcr_iou": iou_loss * iou_weight,
+            #"loss_dcr_iou": iou_loss ,
         }
 
         return loss
@@ -875,8 +874,8 @@ class DCROutputs(nn.Module):
         if len(candidate_inds):
             dist = ((pred_cent[0].permute(0,2,3,1).reshape(-1,1,3) - candidate_inds) ** 2)
             candidate_inds = (-dist.sum(dim=2)).topk(30,dim=0)[1]
-            #iou_trg, reg_idx = iou_trg[candidate_inds].max(dim=0)
-            iou_trg, reg_idx = pred_iou[0,candidate_inds].max(dim=0)
+            iou_trg, reg_idx = iou_trg[candidate_inds].max(dim=0)
+            #iou_trg, reg_idx = pred_iou[0,candidate_inds].max(dim=0)
             box_pred = box_pred[candidate_inds][reg_idx,torch.arange(len(reg_idx)),:]
             per_box_cls, per_class = pred_cls[:,candidate_inds,:].max(dim=1)[0].max(dim=-1)
             per_locations = location[candidate_inds][reg_idx, torch.arange(len(reg_idx)), :]

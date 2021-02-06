@@ -1,4 +1,4 @@
-_BASE_: "Base-DCRv2.yaml"
+_BASE_: "Base-DCRv3.yaml"
 MODEL:
   WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
   RESNETS:
@@ -8,7 +8,7 @@ MODEL:
     POS_SAMPLE_INIT: -0.9
 INPUT:
   MIN_SIZE_TRAIN: (800,)
-OUTPUT_DIR: "output/dcrv2/R_50_1x"
+OUTPUT_DIR: "output/dcrv3/R_50_1x"
 DATASETS:
   TRAIN: ("coco_2017_val",)
   TEST: ("coco_2017_val",)
