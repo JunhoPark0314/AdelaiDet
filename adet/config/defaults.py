@@ -54,6 +54,7 @@ _C.MODEL.DCR.LOC_LOSS_TYPE = 'giou'
 _C.MODEL.DCR.POS_SAMPLE_INIT = -1.0
 _C.MODEL.DCR.POS_SAMPLE_LIMIT = 0.5
 _C.MODEL.DCR.INSTANCE_WEIGHT = False
+_C.MODEL.DCR.REG_ON_CLS = False
 
 # ---------------------------------------------------------------------------- #
 # FCOS Head

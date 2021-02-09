@@ -79,6 +79,7 @@ class DCROutputs(nn.Module):
         self.strides = cfg.MODEL.DCR.FPN_STRIDES
         self.instance_weight = cfg.MODEL.DCR.INSTANCE_WEIGHT
         self.vis_period = cfg.VIS_PERIOD
+        self.reg_on_cls = cfg.MODEL.DCR.REG_ON_CLS
 
 
         # generate sizes of interest
@@ -549,6 +550,11 @@ class DCROutputs(nn.Module):
 
             cls_pos_inds_per_im = compute_pos_inds(cls_locations_to_gt_inds, cls_locations_to_min_area, num_target)
             reg_pos_inds_per_im = compute_pos_inds(reg_locations_to_gt_inds, reg_locations_to_min_area, num_target)
+
+            if self.reg_on_cls:
+                target_ind = (reg_pos_inds_per_im == -1) * (cls_pos_inds_per_im != -1)
+                reg_pos_inds_per_im[target_ind] = cls_pos_inds_per_im[target_ind]
+
             disp_pos_inds_per_im = compute_pos_inds(disp_locations_to_gt_inds, disp_locations_to_min_area, num_target)
 
             reg_neg_inds_per_im = is_in_boxes["reg_neg"].sum(dim=1).bool()
