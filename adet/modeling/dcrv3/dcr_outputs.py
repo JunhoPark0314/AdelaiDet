@@ -77,6 +77,7 @@ class DCROutputs(nn.Module):
         self.num_classes = cfg.MODEL.DCR.NUM_CLASSES
         self.strides = cfg.MODEL.DCR.FPN_STRIDES
         self.instance_weight = cfg.MODEL.DCR.INSTANCE_WEIGHT
+        self.pos_sample_limit = cfg.MODEL.DCR.POS_SAMPLE_LIMIT - 0.1
 
 
         # generate sizes of interest
@@ -235,20 +236,43 @@ class DCROutputs(nn.Module):
         center_bbox = torch.stack((left, top, right, bottom), -1)
         inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0
         return inside_gt_bbox_mask
+
+    def gmm_with_GT(self, target, device):
+        min_init, max_init = target.min(), target.max()
+        means_init = [[min_init], [max_init]]
+        weights_init = [0.5, 0.5]
+        precisions_init = [[[1.0]], [[1.0]]]
+        gmm = skm.GaussianMixture(2,
+                    weights_init=weights_init,
+                    means_init=means_init,
+                    precisions_init=precisions_init
+                    )
+        gmm.fit(target)
+        components = gmm.predict(target)
+        scores = gmm.score_samples(components.reshape(-1,1))
+
+        return torch.from_numpy(components).to(device), torch.from_numpy(scores).to(device)
     
     def per_target_cls_threshold_region(self, pred_cls_logits, target_dict, cls_in_boxes):
         cls_weight = None
         score_per_target = pred_cls_logits[:,target_dict['gt_classes']].sigmoid()
         in_box_logits = score_per_target.squeeze(1)[cls_in_boxes]
 
-        if len(in_box_logits):
-            score_mean = in_box_logits.mean()
-            score_std = in_box_logits.std()
-        else:
-            score_mean = 0.0
-            score_std = 0.0
+        if self.pos_sample_rate < self.pos_sample_limit:
+            if len(in_box_logits):
+                score_mean = in_box_logits.mean()
+                score_std = in_box_logits.std()
+            else:
+                score_mean = 0.0
+                score_std = 0.0
+            cls_thr = score_mean + score_std * self.pos_sample_rate
 
-        cls_pos_per_target = (score_per_target > score_mean + score_std * self.pos_sample_rate).squeeze(1)
+        else:
+            #fit 2-mode GMM per GT
+            components, scores = self.gmm_with_GT(in_box_logits.view(-1,1).cpu().numpy(), in_box_logits.device)
+            cls_thr = in_box_logits[components == 1].min()
+
+        cls_pos_per_target = (score_per_target >= cls_thr).squeeze(1)
 
         if self.instance_weight:
             cls_dump = pred_cls_logits[cls_in_boxes].sigmoid()
@@ -263,15 +287,21 @@ class DCROutputs(nn.Module):
         iou_per_target = pairwise_iou(target_dict["gt_boxes"], Boxes(pred_box))
         in_box_iou = iou_per_target.squeeze(0)[reg_in_boxes]
 
-        if len(in_box_iou):
-            iou_mean = in_box_iou.mean()
-            iou_std = in_box_iou.std()
+
+        if self.pos_sample_rate < self.pos_sample_limit:
+            if len(in_box_iou):
+                iou_mean = in_box_iou.mean()
+                iou_std = in_box_iou.std()
+            else:
+                iou_mean = 0.0
+                iou_std = 0.0
+            iou_thr = iou_mean + iou_std * self.pos_sample_rate    
         else:
-            iou_mean = 0.0
-            iou_std = 0.0
-        
-        reg_pos_per_target = (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
-        reg_neg_per_target = (iou_per_target < iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+            components, scores = self.gmm_with_GT(in_box_iou.view(-1,1).cpu().numpy(), in_box_iou.device)
+            iou_thr = in_box_iou[components == 1].min()
+
+        reg_pos_per_target = (iou_per_target >= iou_thr).squeeze(0)
+        reg_neg_per_target = (iou_per_target < iou_thr).squeeze(0)
 
         if self.instance_weight:
             iou_dump = iou_per_target.squeeze(0)[reg_in_boxes]

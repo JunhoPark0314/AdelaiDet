@@ -125,11 +125,12 @@ class DCRv2(nn.Module):
             return results, losses
         else:
             #pred_result["num_touch"] = num_touch
+            self.dcr_outputs.pos_sample_rate = 0.5
             training_target = None
             if len(gt_instances[0]):
                 training_target = self.dcr_outputs._get_ground_truth(locations, gt_instances, pred_result, images.image_sizes)
             results, analysis = self.dcr_outputs.predict_proposals(
-                pred_result, locations, images.image_sizes, 
+                pred_result, locations, images, 
                 training_target = training_target if training_target is not None else None
             )
 
@@ -216,7 +217,7 @@ class DCRHead(nn.Module):
             stride=1, padding=1
         )
         self.pred_disp = nn.Conv2d(
-            in_channels, 2,
+            in_channels, 4,
             kernel_size=3, stride=1,
             padding=1
         )
@@ -245,6 +246,7 @@ class DCRHead(nn.Module):
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         torch.nn.init.constant_(self.pred_cls.bias, bias_value)
         torch.nn.init.constant_(self.pred_iou.bias, bias_value)
+        torch.nn.init.constant_(self.pred_disp.bias, bias_value)
 
     def forward(self, x):
         # logits
@@ -267,19 +269,17 @@ class DCRHead(nn.Module):
 
                 elif 'BBOX' == head:
                     reg = self.bbox_pred(feature)
-                    iou = self.pred_iou(feature)
 
                     if self.scales is not None:
                         reg = self.scales[k](reg)
 
-                    pred_reg.append(reg.exp())
-                    pred_iou.append(iou)
+                    reg[:,2:] = reg[:,2:].exp()
+                    pred_reg.append(reg)
                 elif 'DISP' == head:
                     disp = self.pred_disp(feature)
-                    #if self.scales is not None:
-                    #    disp = self.scales[k](disp)
-
-                    pred_disp.append(disp.tanh())
+                    iou = self.pred_iou(feature)
+                    pred_disp.append(disp)
+                    pred_iou.append(iou)
 
         pred_result = {
             "pred_cls": pred_cls,
