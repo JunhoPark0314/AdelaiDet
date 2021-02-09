@@ -165,6 +165,7 @@ class DCROutputs(nn.Module):
             vis_name = 'lvl{}'.format(l)
             storage.put_image(vis_name, torch.tensor(img).permute(2,0,1))
             st = en
+            plt.close()
 
     def iterate_disp(self, pred_disp, pos_inds = None, self_dir = None, image = None):
 
