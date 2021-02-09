@@ -14,7 +14,7 @@ from detectron2.utils.events import get_event_storage
 from .dcr_outputs import DCROutputs
 
 
-__all__ = ["DCR"]
+__all__ = ["DCRv3"]
 
 INF = 100000000
 
@@ -125,11 +125,12 @@ class DCRv3(nn.Module):
             return results, losses
         else:
             #pred_result["num_touch"] = num_touch
+            self.dcr_outputs.pos_sample_rate = 0.5
             training_target = None
             if len(gt_instances[0]):
                 training_target = self.dcr_outputs._get_ground_truth(locations, gt_instances, pred_result, images.image_sizes)
             results, analysis = self.dcr_outputs.predict_proposals(
-                pred_result, locations, images.image_sizes, 
+                pred_result, locations, images, 
                 training_target = training_target if training_target is not None else None
             )
 
@@ -272,14 +273,12 @@ class DCRHead(nn.Module):
                     if self.scales is not None:
                         reg = self.scales[k](reg)
 
-                    pred_reg.append(reg.exp())
+                    reg[:,2:] = reg[:,2:].exp()
+                    pred_reg.append(reg)
                     pred_iou.append(iou)
                 elif 'DISP' == head:
                     disp = self.pred_disp(feature)
-                    #if self.scales is not None:
-                    #    disp = self.scales[k](disp)
-
-                    pred_disp.append(disp.tanh())
+                    pred_disp.append(disp)
 
         pred_result = {
             "pred_cls": pred_cls,

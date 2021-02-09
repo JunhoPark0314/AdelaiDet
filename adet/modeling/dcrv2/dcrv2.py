@@ -14,7 +14,7 @@ from detectron2.utils.events import get_event_storage
 from .dcr_outputs import DCROutputs
 
 
-__all__ = ["DCR"]
+__all__ = ["DCRv2"]
 
 INF = 100000000
 
