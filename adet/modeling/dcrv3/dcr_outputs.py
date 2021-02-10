@@ -9,11 +9,12 @@ import copy
 from detectron2.layers import cat
 from detectron2.structures import Instances, Boxes
 from detectron2.utils.comm import get_world_size
+from detectron2.utils.events import get_event_storage
 from fvcore.nn import sigmoid_focal_loss_jit
 import sklearn.mixture as skm
 
 from adet.utils.comm import reduce_sum
-from adet.layers import ml_nms, IOULoss
+from adet.layers import ml_nms, IOUExtendLoss
 from detectron2.structures import pairwise_iou
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ class DCROutputs(nn.Module):
         self.pre_nms_thresh_train = cfg.MODEL.DCR.INFERENCE_TH_TRAIN
         self.pre_nms_topk_train = cfg.MODEL.DCR.PRE_NMS_TOPK_TRAIN
         self.post_nms_topk_train = cfg.MODEL.DCR.POST_NMS_TOPK_TRAIN
-        self.loc_loss_func = IOULoss(cfg.MODEL.DCR.LOC_LOSS_TYPE)
+        self.loc_loss_func = IOUExtendLoss(cfg.MODEL.DCR.LOC_LOSS_TYPE)
         self.iou_loss_func = nn.BCEWithLogitsLoss(reduction="sum")
         self.disp_loss_func = nn.SmoothL1Loss(reduction="sum")
 
@@ -77,19 +78,96 @@ class DCROutputs(nn.Module):
         self.num_classes = cfg.MODEL.DCR.NUM_CLASSES
         self.strides = cfg.MODEL.DCR.FPN_STRIDES
         self.instance_weight = cfg.MODEL.DCR.INSTANCE_WEIGHT
-        self.pos_sample_limit = cfg.MODEL.DCR.POS_SAMPLE_LIMIT - 0.1
+        self.vis_period = cfg.VIS_PERIOD
+        self.reg_on_cls = cfg.MODEL.DCR.REG_ON_CLS
 
 
         # generate sizes of interest
         soi = []
-        prev_size = -1
+        prev_size = 0
         for s in cfg.MODEL.DCR.SIZES_OF_INTEREST:
             soi.append([prev_size, s])
             prev_size = s
         soi.append([prev_size, INF])
         self.sizes_of_interest = soi
+    
+    def draw_field(self, location, pred_disp, self_dir, pos_inds, image, i):
+        import matplotlib.pyplot as plt
+        N, _, H, W = pred_disp.shape
+        plt.figure(figsize=(W*2//10, H*2//10))
+        pred_disp = pred_disp.permute(0,2,3,1)
+        location = location.reshape(N, H, W, -1)
+        X = location[0,:,:,0].detach().cpu().numpy()
+        Y = location[0,:,:,1].detach().cpu().numpy()
+        U = pred_disp[0,:,:,0].detach().cpu().numpy()
+        V = pred_disp[0,:,:,1].detach().cpu().numpy()
+        self_dir = self_dir[0].detach().cpu().numpy()
+        pos_inds = pos_inds[0].detach().cpu().numpy()
+        image -= image.min()
+        image /= image.max()
+        image = F.interpolate(image.unsqueeze(0), size=(H, W)).squeeze(0).permute(1,2,0).detach().cpu().numpy()[:,:,::-1]
+        import numpy as np
+        plt.title("scales with x view")
+        M = np.hypot(V, U)
+        Q = plt.quiver(X[~self_dir], Y[~self_dir], U[~self_dir], -V[~self_dir],  M[~self_dir], units='x', width=0.22,
+                    scale=1 / 1)
+        qk = plt.quiverkey(Q, 0.9, 0.9, 1, r'$1 \frac{m}{s}$', labelpos='E',
+                        coordinates='figure')
+        plt.scatter(X, Y, color='k', s=0.01)
+        plt.scatter(X[pos_inds], Y[pos_inds], color='blue', s=40)
+        plt.scatter(X[self_dir * pos_inds], Y[self_dir * pos_inds], color='red', s=20)
 
-    def iterate_disp(self, pred_disp):
+        plt.imshow(image)
+        plt.tight_layout()
+
+
+        plt.savefig("output/dcrv2/server-14/inference/field_{}_{}.png".format(H*W,i))
+
+    def write_debug_img(self, num_loc_list, locations, reg_pos_inds_per_im, cls_pos_inds_per_im, disp_targets_per_im, disp_pos_inds_per_im, centers, bboxes):
+        storage = get_event_storage()
+        st = 0
+        for l, num_loc in enumerate(num_loc_list):
+            en = st + num_loc
+            X = locations[st:en,0].detach().cpu().numpy()
+            Y = locations[st:en,1].detach().cpu().numpy()
+            U = disp_targets_per_im[st:en,0].detach().cpu().numpy()
+            V = disp_targets_per_im[st:en,1].detach().cpu().numpy()
+            reg_pos = (reg_pos_inds_per_im[st:en] != -1).detach().cpu().numpy()
+            cls_pos = (cls_pos_inds_per_im[st:en] != -1).detach().cpu().numpy()
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import io
+            import cv2
+            M = disp_pos_inds_per_im[st:en].detach().cpu().numpy()
+            fig = plt.figure(figsize=(X.max()/60, Y.max()/60))
+            plt.quiver(X, Y, U, V, M, units="xy", angles="xy", width=1, scale=1)
+            plt.scatter(X[reg_pos], Y[reg_pos], color='red', s=40, alpha=0.7, marker='+')
+            plt.scatter(X[cls_pos], Y[cls_pos], color='blue', s=40, alpha=0.7, marker='x')
+            plt.scatter(centers[:,0].detach().cpu().numpy(), centers[:,1].detach().cpu(), c=np.arange(len(bboxes)), cmap=plt.cm.rainbow, s=40)
+            buf = io.BytesIO()
+            ax = plt.gca()
+            for rl ,rec in enumerate(bboxes):
+                import matplotlib.patches as patches
+                rect = patches.Rectangle(
+                    (rec[0].item(), rec[1].item()),
+                    rec[2] - rec[0],
+                    rec[3] - rec[1],
+                    linewidth=2,
+                    fill= False
+                )
+                ax.add_patch(rect)
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            img_arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+            buf.close()
+            img = cv2.imdecode(img_arr, 1)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            vis_name = 'lvl{}'.format(l)
+            storage.put_image(vis_name, torch.tensor(img).permute(2,0,1))
+            st = en
+            plt.close()
+
+    def iterate_disp(self, pred_disp, pos_inds = None, self_dir = None, image = None):
 
         #num_it = int((max(self.pos_sample_rate + 0.5, 0)) // 0.2)
         num_it = 4
@@ -99,22 +177,38 @@ class DCROutputs(nn.Module):
         for i in range(num_it):
             for l, (disp_per_level, num_touch_per_level) in enumerate(zip(pred_disp, num_touch)):
                 N, _, H, W  = disp_per_level.shape
-                location = cat([disp_per_level.new_ones(H, W).nonzero().reshape(1, H, W, 2)] * N).permute(0,3,1,2)
+                location = disp_per_level.new_ones(H, W).nonzero().reshape(1,H, W, 2)[:,:,:,[1,0]]
+                #location = cat([disp_per_level.new_ones(H, W).nonzero().reshape(1, H, W, 2)] * N).permute(0,3,1,2)
+                #self.draw_field(location, disp_per_level, self_dir, pos_inds!=-1, image, i)
+                location = location.permute(0,3,1,2)
                 pred_cent = (location + disp_per_level).long()
                 # Need clamp here
-                pred_cent[:,0,:,:] = pred_cent[:,0].clamp(0,H-1)
-                pred_cent[:,1,:,:] = pred_cent[:,1].clamp(0,W-1)
+                pred_cent[:,0,:,:] = pred_cent[:,0].clamp(0,W-1)
+                pred_cent[:,1,:,:] = pred_cent[:,1].clamp(0,H-1)
                 pred_cent = cat([torch.arange(N, device=pred_cent.device).reshape(-1,1).repeat(1,H*W).reshape(N,1,H,W), pred_cent], dim=1)
 
                 pred_cent_flatten = pred_cent.permute(0,2,3,1).reshape(-1,3)
-                assert torch.logical_and(pred_cent_flatten[:,1].max() < H, pred_cent_flatten[:,1].min() >= 0).item()
-                assert torch.logical_and(pred_cent_flatten[:,2].max() < W, pred_cent_flatten[:,2].min() >= 0).item()
+                assert torch.logical_and(pred_cent_flatten[:,1].max() < W, pred_cent_flatten[:,1].min() >= 0).item()
+                assert torch.logical_and(pred_cent_flatten[:,2].max() < H, pred_cent_flatten[:,2].min() >= 0).item()
 
                 unique_pred_cent, pred_count = pred_cent_flatten.unique(dim=0, return_counts=True)
                 new_touch = torch.zeros_like(num_touch_per_level)
-                new_touch[unique_pred_cent[:,0],unique_pred_cent[:,1], unique_pred_cent[:,2]] = pred_count
+                new_touch[unique_pred_cent[:,0],unique_pred_cent[:,2], unique_pred_cent[:,1]] = pred_count
 
-                inner_disp = disp_per_level[pred_cent_flatten[:,0], :, pred_cent_flatten[:,1], pred_cent_flatten[:,2]].reshape(N, H, W, 2).permute(0,3,1,2)
+                """
+                import matplotlib.pyplot as plt
+                plt.figure()
+                mask = (new_touch[new_touch!=0]!=1).reshape(-1)
+                Y = new_touch.nonzero()[mask,1]
+                X = new_touch.nonzero()[mask,2]
+                sc = plt.scatter(X.detach().cpu().numpy(), H - 1 - Y.detach().cpu().numpy(), 10 ,c=new_touch[0,Y,X].detach().cpu().numpy())
+                plt.colorbar(sc)
+                plt.xlim([0,W])
+                plt.ylim([0,H])
+                plt.savefig('output/dcrv2/server-14/inference/num_touch_{}_{}.png'.format(H*W,i))
+                """
+
+                inner_disp = disp_per_level[pred_cent_flatten[:,0], :, pred_cent_flatten[:,2], pred_cent_flatten[:,1]].reshape(N, H, W, 2).permute(0,3,1,2)
                 pred_disp[l] = inner_disp + disp_per_level
                 num_touch[l] = new_touch
                 result_cent[l] = pred_cent
@@ -170,116 +264,35 @@ class DCROutputs(nn.Module):
                 k: self._transpose(v, num_loc_list) for k, v in trg_target.items()
             }   
 
-        def get_angle(ctr, stride):
-            v_len = torch.linalg.norm(ctr[l], dim=1) / stride
-            base = torch.zeros_like(ctr[l])
-            base[:,0] = 1
-            v_angle = torch.cross(F.pad(ctr[l], (1, 0)),F.pad(base, (1,0)))[:,2].asin()
-            return cat([v_len, v_angle], dim=1)
-
         # we normalize reg_targets by FPN's strides here
         reg_targets = training_target["reg"]["targets"]
         disp_targets = training_target["disp"]["targets"]
         for l in range(len(reg_targets)):
             reg_targets[l] = reg_targets[l] / float(self.strides[l])
             disp_targets[l] = disp_targets[l] / float(self.strides[l])
-            disp_targets[l] = disp_targets[l].clamp(-1,1)
-
-            # change ctr vector to angle and length 
-            #disp_targets[l] = get_angle(disp_targets[l], float(self.strides[l]))
 
         return training_target
 
-    def get_sample_region(self, boxes, strides, num_loc_list, loc_xs, loc_ys, bitmasks=None, radius=1):
-        if bitmasks is not None:
-            _, h, w = bitmasks.size()
-
-            ys = torch.arange(0, h, dtype=torch.float32, device=bitmasks.device)
-            xs = torch.arange(0, w, dtype=torch.float32, device=bitmasks.device)
-
-            m00 = bitmasks.sum(dim=-1).sum(dim=-1).clamp(min=1e-6)
-            m10 = (bitmasks * xs).sum(dim=-1).sum(dim=-1)
-            m01 = (bitmasks * ys[:, None]).sum(dim=-1).sum(dim=-1)
-            center_x = m10 / m00
-            center_y = m01 / m00
-        else:
-            center_x = boxes[..., [0, 2]].sum(dim=-1) * 0.5
-            center_y = boxes[..., [1, 3]].sum(dim=-1) * 0.5
-
-        num_gts = boxes.shape[0]
-        K = len(loc_xs)
-        boxes = boxes[None].expand(K, num_gts, 4)
-        center_x = center_x[None].expand(K, num_gts)
-        center_y = center_y[None].expand(K, num_gts)
-        center_gt = boxes.new_zeros(boxes.shape)
-        # no gt
-        if center_x.numel() == 0 or center_x[..., 0].sum() == 0:
-            return loc_xs.new_zeros(loc_xs.shape, dtype=torch.uint8)
-        beg = 0
-        for level, num_loc in enumerate(num_loc_list):
-            end = beg + num_loc
-            stride = strides[level] * radius
-            xmin = center_x[beg:end] - stride
-            ymin = center_y[beg:end] - stride
-            xmax = center_x[beg:end] + stride
-            ymax = center_y[beg:end] + stride
-            # limit sample region in gt
-            center_gt[beg:end, :, 0] = torch.where(xmin > boxes[beg:end, :, 0], xmin, boxes[beg:end, :, 0])
-            center_gt[beg:end, :, 1] = torch.where(ymin > boxes[beg:end, :, 1], ymin, boxes[beg:end, :, 1])
-            center_gt[beg:end, :, 2] = torch.where(xmax > boxes[beg:end, :, 2], boxes[beg:end, :, 2], xmax)
-            center_gt[beg:end, :, 3] = torch.where(ymax > boxes[beg:end, :, 3], boxes[beg:end, :, 3], ymax)
-            beg = end
-        left = loc_xs[:, None] - center_gt[..., 0]
-        right = center_gt[..., 2] - loc_xs[:, None]
-        top = loc_ys[:, None] - center_gt[..., 1]
-        bottom = center_gt[..., 3] - loc_ys[:, None]
-        center_bbox = torch.stack((left, top, right, bottom), -1)
-        inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0
-        return inside_gt_bbox_mask
-
-    def gmm_with_GT(self, target, device):
-        min_init, max_init = target.min(), target.max()
-        means_init = [[min_init], [max_init]]
-        weights_init = [0.5, 0.5]
-        precisions_init = [[[1.0]], [[1.0]]]
-        gmm = skm.GaussianMixture(2,
-                    weights_init=weights_init,
-                    means_init=means_init,
-                    precisions_init=precisions_init
-                    )
-        gmm.fit(target)
-        components = gmm.predict(target)
-        scores = gmm.score_samples(components.reshape(-1,1))
-
-        return torch.from_numpy(components).to(device), torch.from_numpy(scores).to(device)
-    
     def per_target_cls_threshold_region(self, pred_cls_logits, target_dict, cls_in_boxes):
         cls_weight = None
         score_per_target = pred_cls_logits[:,target_dict['gt_classes']].sigmoid()
         in_box_logits = score_per_target.squeeze(1)[cls_in_boxes]
 
-        if self.pos_sample_rate < self.pos_sample_limit:
-            if len(in_box_logits):
-                score_mean = in_box_logits.mean()
-                score_std = in_box_logits.std()
-            else:
-                score_mean = 0.0
-                score_std = 0.0
-            cls_thr = score_mean + score_std * self.pos_sample_rate
-
+        if len(in_box_logits) > 1:
+            score_mean = in_box_logits.mean()
+            score_std = in_box_logits.std()
         else:
-            #fit 2-mode GMM per GT
-            components, scores = self.gmm_with_GT(in_box_logits.view(-1,1).cpu().numpy(), in_box_logits.device)
-            cls_thr = in_box_logits[components == 1].min()
+            score_mean = 0.0
+            score_std = 0.0
 
-        cls_pos_per_target = (score_per_target >= cls_thr).squeeze(1)
+        cls_pos_per_target = (score_per_target > score_mean + score_std * self.pos_sample_rate).squeeze(1)
 
         if self.instance_weight:
             cls_dump = pred_cls_logits[cls_in_boxes].sigmoid()
             cls_iw_recall = (cls_dump[:,target_dict["gt_classes"]] > self.pre_nms_thresh_test).sum() / ((cls_dump > self.pre_nms_thresh_test).sum() + 1e-6)
             cls_weight = 1 - cls_iw_recall
 
-        return cls_pos_per_target,  cls_weight
+        return cls_pos_per_target, cls_weight
 
 
     def per_target_reg_threshold_region(self, pred_box, target_dict, reg_in_boxes):
@@ -287,21 +300,16 @@ class DCROutputs(nn.Module):
         iou_per_target = pairwise_iou(target_dict["gt_boxes"], Boxes(pred_box))
         in_box_iou = iou_per_target.squeeze(0)[reg_in_boxes]
 
-
-        if self.pos_sample_rate < self.pos_sample_limit:
-            if len(in_box_iou):
-                iou_mean = in_box_iou.mean()
-                iou_std = in_box_iou.std()
-            else:
-                iou_mean = 0.0
-                iou_std = 0.0
-            iou_thr = iou_mean + iou_std * self.pos_sample_rate    
+        if len(in_box_iou) > 1:
+            iou_mean = in_box_iou.mean()
+            iou_std = in_box_iou.std()
         else:
-            components, scores = self.gmm_with_GT(in_box_iou.view(-1,1).cpu().numpy(), in_box_iou.device)
-            iou_thr = in_box_iou[components == 1].min()
-
-        reg_pos_per_target = (iou_per_target >= iou_thr).squeeze(0)
-        reg_neg_per_target = (iou_per_target < iou_thr).squeeze(0)
+            iou_mean = 0.0
+            iou_std = 0.0
+        
+        #print(in_box_iou.max())
+        reg_pos_per_target = (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+        reg_neg_per_target = (iou_per_target < iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
 
         if self.instance_weight:
             iou_dump = iou_per_target.squeeze(0)[reg_in_boxes]
@@ -313,10 +321,11 @@ class DCROutputs(nn.Module):
 
     @torch.no_grad()
     def get_threshold_region(
-        self, is_in_boxes, is_in_boxes_surrond, pred_result, targets_per_im, locations, image_size
+        self, is_in_boxes, pred_result, targets_per_im, locations, image_size
     ):
+
         reg_in_boxes = copy.deepcopy(is_in_boxes)
-        reg_neg_boxes = copy.deepcopy(is_in_boxes_surrond)
+        reg_neg_boxes = copy.deepcopy(is_in_boxes)
         cls_in_boxes = copy.deepcopy(is_in_boxes)
         # prepare prediction per grid
 
@@ -338,7 +347,7 @@ class DCROutputs(nn.Module):
 
             reg_pos_per_target, reg_neg_per_target, reg_weight_per_target = self.per_target_reg_threshold_region(pred_box, target_dict, reg_in_boxes[:,l])
             reg_in_boxes[:,l] *= reg_pos_per_target
-            reg_neg_boxes[:,l] *= (reg_neg_per_target)
+            reg_neg_boxes[:,l] *= reg_neg_per_target
 
             if self.instance_weight:
                 cls_weight.append(cls_weight_per_target)
@@ -397,6 +406,7 @@ class DCROutputs(nn.Module):
             targets_per_im = targets[im_i]
             image_size_per_im = image_size[im_i]
             bboxes = targets_per_im.gt_boxes.tensor
+            centers = targets_per_im.gt_boxes.get_centers()
             cls_targets_per_im = targets_per_im.gt_classes
             disp_targets_per_im = targets_per_im.gt_boxes.get_centers()
 
@@ -407,97 +417,102 @@ class DCROutputs(nn.Module):
                 disp_training_target.append(self.no_gt_disp_target(locations))
                 continue
 
-            # compute area and limit the regression positive to in box
-            area = targets_per_im.gt_boxes.area()
+            dx = centers[:, 0][None] - xs[:, None] 
+            dy = centers[:, 1][None] - ys[:, None]
+            dw = (bboxes[:, 2] - bboxes[:, 0]).unsqueeze(0).repeat(len(dx),1)
+            dh = (bboxes[:, 3] - bboxes[:, 1]).unsqueeze(0).repeat(len(dx),1)
+            area_per_im = (dw * dh).sqrt()
+            reg_targets_per_im = torch.stack([dx, dy, dw, dh], dim=2)
+            dist_ratio = ((dx ** 2 + dy ** 2)).sqrt()
 
             l = xs[:, None] - bboxes[:, 0][None]
             t = ys[:, None] - bboxes[:, 1][None]
             r = bboxes[:, 2][None] - xs[:, None]
             b = bboxes[:, 3][None] - ys[:, None]
-            reg_targets_per_im = torch.stack([l, t, r, b], dim=2)
+            in_box_per_im = torch.stack([l, t, r, b], dim=2)
 
+            is_in_boxes_pure = in_box_per_im.min(dim=2)[0] > 0
+            is_in_boxes_surround = (in_box_per_im.min(dim=2)[0] + loc_to_strides > 0)
+            no_in_box_pure = is_in_boxes_pure.sum(dim=0) <= 10
+            if no_in_box_pure.any().item():
+                is_in_boxes_pure[:,no_in_box_pure] = is_in_boxes_surround[:,no_in_box_pure]
 
-            is_in_boxes_surrond = (reg_targets_per_im.min(dim=2)[0] + loc_to_strides > 0)
-            is_in_boxes_pure = (reg_targets_per_im.min(dim=2)[0] > 0)
-            
-
-            # limit the regression range for each location
-            max_reg_targets_per_im = reg_targets_per_im.max(dim=2)[0]
-            is_cared_in_the_level = \
-                (max_reg_targets_per_im >= size_ranges[:, [0]]) & \
-                (max_reg_targets_per_im <= size_ranges[:, [1]])
+            is_cared_in_the_level = (area_per_im >= size_ranges[:,0][:,None]) * \
+                 (area_per_im < size_ranges[:,1][:,None])
 
             pred_per_im = {
                 "pred_cls": cat([x[im_i].permute(1,2,0).reshape(-1, self.num_classes) for x in pred_result["pred_cls"]]),
                 "pred_reg": cat([(x[im_i] * s).permute(1,2,0).reshape(-1,4) for x, s in zip(pred_result["pred_reg"], self.strides)]),
             }
 
-            if self.is_in_boxes == "center_sampling":
-                if targets_per_im.has("gt_bitmasks_full"):
-                    bitmasks = targets_per_im.gt_bitmasks_full
-                else:
-                    bitmasks = None
-                is_in_boxes = self.get_sample_region(
-                    bboxes, self.strides, num_loc_list, xs, ys,
-                    bitmasks=bitmasks, radius=self.radius
-                )
-            elif self.is_in_boxes == "above_threshold":
-
-                is_in_boxes, weights  = self.get_threshold_region(
-                    is_in_boxes_pure * is_cared_in_the_level, 
-                    is_in_boxes_surrond * is_cared_in_the_level,
-                    pred_per_im,
-                    targets_per_im, 
-                    locations,
-                    image_size_per_im
-                )
-
-            else:
-                is_in_boxes = is_in_boxes_pure
-
-            def choose_among_multiple_gt(gt_area, is_in_boxes, is_cared_in_the_level):
-                gt_area[is_in_boxes == 0] = INF
-                gt_area[is_cared_in_the_level == 0] = INF
-                return gt_area.min(dim=1)
+            is_in_boxes, weights  = self.get_threshold_region(
+                is_in_boxes_pure * is_cared_in_the_level, 
+                pred_per_im,
+                targets_per_im, 
+                locations,
+                image_size_per_im
+            )
             
-            def compute_pos_inds(locations_to_gt_inds, locations_to_gt_area, num_target):
+            def choose_among_multiple_gt(gt_dist, is_in_boxes, is_cared_in_the_level):
+                gt_dist = copy.deepcopy(gt_dist)
+                gt_dist[is_in_boxes == 0] = INF
+                gt_dist[is_cared_in_the_level == 0] = INF
+                return gt_dist.min(dim=1)
+            
+            def compute_pos_inds(locations_to_gt_inds, locations_to_gt_dist, num_target):
                 pos_inds_per_im = locations_to_gt_inds + num_target
-                pos_inds_per_im[locations_to_gt_area == INF] = -1
+                pos_inds_per_im[locations_to_gt_dist == INF] = -1
                 return pos_inds_per_im
 
             # if there are still more than one objects for a location,
             # we choose the one with minimal area
 
-            locations_to_gt_area = area[None].repeat(len(locations), 1)
+            cls_locations_to_min_dist, cls_locations_to_gt_inds = choose_among_multiple_gt(dist_ratio, is_in_boxes["cls"], is_cared_in_the_level)
+            reg_locations_to_min_dist, reg_locations_to_gt_inds = choose_among_multiple_gt(dist_ratio, is_in_boxes["reg"], is_cared_in_the_level)
 
-            cls_locations_to_min_area, cls_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["cls"], is_cared_in_the_level)
-            reg_locations_to_min_area, reg_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes["reg"], is_cared_in_the_level)
-            disp_locations_to_min_area, disp_locations_to_gt_inds = choose_among_multiple_gt(locations_to_gt_area, is_in_boxes_surrond, is_cared_in_the_level)
+            cls_pos_inds_per_im = compute_pos_inds(cls_locations_to_gt_inds, cls_locations_to_min_dist, num_target)
+            reg_pos_inds_per_im = compute_pos_inds(reg_locations_to_gt_inds, reg_locations_to_min_dist, num_target)
 
-            # compute pos inds
-            cls_pos_inds_per_im = compute_pos_inds(cls_locations_to_gt_inds, cls_locations_to_min_area, num_target)
-            reg_pos_inds_per_im = compute_pos_inds(reg_locations_to_gt_inds, reg_locations_to_min_area, num_target)
+            if self.reg_on_cls:
+                target_ind = (reg_pos_inds_per_im == -1) * (cls_pos_inds_per_im != -1)
+                reg_pos_inds_per_im[target_ind] = cls_pos_inds_per_im[target_ind]
+
             reg_neg_inds_per_im = is_in_boxes["reg_neg"].sum(dim=1).bool()
             reg_neg_inds_per_im[reg_pos_inds_per_im != -1] = False
-            disp_pos_inds_per_im = compute_pos_inds(disp_locations_to_gt_inds, disp_locations_to_min_area, num_target)
 
             def compute_iou(target, pred, locations, image_size):
-                pred_box = cat([locations - pred[:,:2] , locations + pred[:,2:]], dim=1)
+                pred_ctr = locations + pred[:,:2]
+                pred_box = cat([pred_ctr - pred[:,2:]/2 , pred_ctr + pred[:,2:]/2], dim=1)
                 pred_box[:,[0,2]] = pred_box[:,[0,2]].clamp(0,image_size[1])
                 pred_box[:,[1,3]] = pred_box[:,[1,3]].clamp(0, image_size[0])
 
-                target_box = cat([locations - target[:,:2], locations + target[:,2:]], dim=1)
+                target_ctr = locations + target[:,:2]
+                target_box = cat([target_ctr - target[:,2:]/2, target_ctr + target[:,2:]/2], dim=1)
                 target_box[:,[0,2]] = target_box[:,[0,2]].clamp(0, image_size[1])
                 target_box[:,[1,3]] = target_box[:,[1,3]].clamp(0, image_size[0])
 
                 return matched_boxlist_iou(Boxes(target_box), Boxes(pred_box))
             # compute target
             cls_targets_per_im = cls_targets_per_im[cls_locations_to_gt_inds]
-            cls_targets_per_im[cls_locations_to_min_area == INF] = self.num_classes
+            cls_targets_per_im[cls_locations_to_min_dist == INF] = self.num_classes
             reg_targets_per_im = reg_targets_per_im[torch.arange(len(reg_locations_to_gt_inds)),reg_locations_to_gt_inds,:]
             iou_targets_per_im = compute_iou(reg_targets_per_im, pred_per_im["pred_reg"], locations, image_size_per_im)
-            disp_targets_per_im = locations - disp_targets_per_im[disp_locations_to_gt_inds]
-            disp_targets_per_im[disp_locations_to_min_area == INF] = 0
+            disp_targets_per_im = disp_targets_per_im[cls_locations_to_gt_inds] - locations
+            disp_targets_per_im[cls_locations_to_min_dist == INF] = 0
+
+            try:
+                assert (cls_pos_inds_per_im.unique()[(cls_pos_inds_per_im.unique() != -1)] == \
+                    reg_pos_inds_per_im.unique()[(reg_pos_inds_per_im.unique() != -1)]).all()
+                assert len(cls_pos_inds_per_im.unique()) == (len(targets_per_im) + 1)
+            except:
+                self.write_debug_img(num_loc_list, locations, reg_pos_inds_per_im,
+                    cls_pos_inds_per_im, disp_targets_per_im, cls_pos_inds_per_im, centers, bboxes)
+
+            storage = get_event_storage()
+            if self.vis_period > 0:
+                if storage.iter % self.vis_period == 0 and im_i == 0:
+                    self.write_debug_img(num_loc_list, locations, reg_pos_inds_per_im,
+                        cls_pos_inds_per_im, disp_targets_per_im, cls_pos_inds_per_im, centers, bboxes)
 
             reg_label_per_im = -torch.ones_like(reg_pos_inds_per_im, device=reg_pos_inds_per_im.device).long()
             reg_label_per_im[reg_pos_inds_per_im] = targets_per_im.gt_classes[reg_locations_to_gt_inds[reg_pos_inds_per_im]]
@@ -517,7 +532,7 @@ class DCROutputs(nn.Module):
             }
             disp_training_target_per_im = {
                 "targets": disp_targets_per_im,
-                "pos_inds": disp_pos_inds_per_im,
+                "pos_inds": cls_pos_inds_per_im,
             }
 
             if self.instance_weight:
@@ -704,7 +719,6 @@ class DCROutputs(nn.Module):
             reg_instances.weight /= reg_instances.weight.mean()
 
         if reg_pos_inds.numel() + reg_neg_inds.numel() > 0:
-
             iou_loss = self.iou_loss_func(
                 reg_instances.pred_iou[reg_pos_inds + reg_neg_inds],
                 reg_instances.iou_targets[reg_pos_inds + reg_neg_inds],
@@ -713,17 +727,21 @@ class DCROutputs(nn.Module):
             iou_loss = reg_instances.pred_iou.sum() * 0
 
         if reg_pos_inds.numel() > 0:
+            reg_ctr = reg_instances.pred_reg[reg_pos_inds][:,:2]
+            reg_wh = reg_instances.pred_reg[reg_pos_inds][:,2:]
+            trg_ctr = reg_instances.reg_targets[reg_pos_inds][:,:2]
+            trg_wh = reg_instances.reg_targets[reg_pos_inds][:,2:]
 
             reg_loss = self.loc_loss_func(
-                reg_instances.pred_reg[reg_pos_inds],
-                reg_instances.reg_targets[reg_pos_inds],
+                torch.cat([reg_ctr - reg_wh / 2, reg_ctr + reg_wh / 2],dim=1),
+                torch.cat([trg_ctr - trg_wh / 2, trg_ctr + trg_wh / 2],dim=1),
                 weight=reg_instances.reg_weight.unsqueeze(1) if hasattr(reg_instances, "reg_weight") else None,
             ) / num_reg_pos_avg
 
         else:
             reg_loss = reg_instances.pred_reg.sum() * 0
         
-        iou_weight = torch.max(1 - reg_loss.detach(), 0)[0]
+        iou_weight = max(1 - reg_loss.detach(), 0)
 
         loss = {
             "loss_dcr_reg": reg_loss,
@@ -739,19 +757,13 @@ class DCROutputs(nn.Module):
         total_disp_num_pos = reduce_sum(num_disp_pos_local).item()
         num_disp_pos_avg = max(total_disp_num_pos / num_gpus, 1.0)
 
-        disp_pos_loss = self.disp_loss_func(
+        disp_loss = self.disp_loss_func(
             disp_instances.pred_disp[disp_pos_inds],
             disp_instances.disp_targets[disp_pos_inds],
         ) / num_disp_pos_avg
 
-        disp_neg_loss = self.disp_loss_func(
-            disp_instances.pred_disp[~disp_pos_inds],
-            disp_instances.disp_targets[~disp_pos_inds]
-        ) / (len(disp_pos_inds) - num_disp_pos_avg)
-
         loss = {
-            "loss_dcr_disp_pos": disp_pos_loss,
-            "loss_dcr_disp_neg": disp_neg_loss
+            "loss_dcr_disp": disp_loss,
         }
 
         return loss
@@ -770,7 +782,7 @@ class DCROutputs(nn.Module):
         return instances, losses
 
     def predict_proposals(
-            self, pred_result, locations, image_sizes, training_target=None
+            self, pred_result, locations, images, training_target=None
     ):
         if self.training:
             self.pre_nms_thresh = self.pre_nms_thresh_train
@@ -797,6 +809,7 @@ class DCROutputs(nn.Module):
             bundle["reg_target"] = training_target["reg"]["targets"]
             bundle["cls_target"] = training_target["cls"]["targets"]
             bundle["disp_target"] = training_target["disp"]["targets"]
+            bundle["disp_pos_inds"] = training_target["disp"]["pos_inds"]
             bundle["reg_label"] = training_target["reg"]["labels"]
             bundle["cls_pos_inds"] = training_target["cls"]["pos_inds"]
             bundle["reg_pos_inds"] = training_target["reg"]["pos_inds"]
@@ -809,7 +822,7 @@ class DCROutputs(nn.Module):
             # we denormalize them here.
 
             boxes, analysis = self.forward_for_single_feature_map(
-                per_bundle, image_sizes
+                per_bundle, images
             )
             if len(boxes):
                 sampled_boxes.append(boxes)
@@ -842,7 +855,7 @@ class DCROutputs(nn.Module):
         return tp.sum(), fn.sum(), fp.sum(), jid
 
     def forward_for_single_feature_map(
-            self, bundle, image_sizes
+            self, bundle, images
     ):
 
         results = []
@@ -867,6 +880,7 @@ class DCROutputs(nn.Module):
         _, num_touch, pred_cent = self.iterate_disp([pred_disp])
 
         box_pred = cat([location - pred_reg[0,:,:2], location + pred_reg[0,:,2:]], dim=1)
+        #num_target = bundle["reg_pos_inds"].unique().shape[0] - 1
 
         # calculate true positive, false positive, false negative of prediction
         if "cls_target" in bundle:
@@ -876,8 +890,11 @@ class DCROutputs(nn.Module):
             reg_pos_inds = bundle["reg_pos_inds"] != -1
             reg_neg_inds = bundle["reg_neg_inds"]
             disp_target = bundle["disp_target"]
+            disp_pos_inds = bundle["disp_pos_inds"]
 
             disp_target = disp_target.reshape(N, H, W, 2).permute(0,3,1,2)
+            disp_pos_inds = disp_pos_inds.reshape(N, H, W)
+            self_dir = (disp_target ** 2).sum(dim=1) == 0
             
             true = torch.zeros_like(pred_cls).bool()
             true[:,cls_pos_inds,cls_target[cls_pos_inds]] = 1
@@ -889,29 +906,59 @@ class DCROutputs(nn.Module):
             iou_trg = matched_boxlist_iou(Boxes(reg_trg), Boxes(box_pred))
             analysis["pt"].append(self.calc_stat(reg_pos_inds, pred_iou > self.pre_nms_thresh))
 
-            _, gt_touch, gt_cent = self.iterate_disp([disp_target])
-            #print(gt_cent)
+            _, gt_touch, gt_cent = self.iterate_disp([disp_target],disp_pos_inds, self_dir, images[0])
+            print(gt_cent)
             pred_cent = gt_cent
-
+            pred_iou = iou_trg.unsqueeze(0)
 
         if "cls_target" in bundle:
+            cls_id = bundle["cls_pos_inds"].unique()[1:]
+            reg_id = bundle["reg_pos_inds"].unique()[1:]
+            if (len(cls_id) != 0) and (len(cls_id) == len(reg_id)) and (cls_id == reg_id).all().item():
+                cls_pos = (bundle["cls_pos_inds"].unsqueeze(1) == bundle["cls_pos_inds"].unique()[1:])
+                reg_pos = (bundle["reg_pos_inds"].unsqueeze(1) == bundle["reg_pos_inds"].unique()[1:])
+                box_cls = []
+                box_class = []
+                pred_box = []
+                box_location = []
+                for j in range(len(cls_id)):
+                    per_box_cls, per_class = pred_cls[0,cls_pos[:,j],:].max(dim=1)
+                    t = per_box_cls.argmax()
+                    box_cls.append(per_box_cls[t])
+                    box_class.append(per_class[t])
+                    t = iou_trg[reg_pos[:,j]].argmax()
+                    pred_box.append(box_pred[reg_pos[:,j],:][t].unsqueeze(0))
+                    box_location.append(location[reg_pos[:,j],:][t].unsqueeze(0))
+
+                box_cls = torch.stack(box_cls)
+                box_class = torch.stack(box_class)
+                pred_box = cat(pred_box, dim=0)
+                box_location = cat(box_location, dim=0)
+
+                boxlist = Instances(images.image_sizes[0])
+                boxlist.pred_boxes = Boxes(pred_box)
+                boxlist.scores = box_cls
+                boxlist.pred_classes = box_class
+                boxlist.locations = box_location
+                results.append(boxlist)
+                return results, analysis
+
             candidate_inds = (gt_touch[0] > 1).nonzero()
             #candidate_inds = box_logits > self.pre_nms_thresh
         else:
             candidate_inds = (num_touch[0] > 1).nonzero()
-            iou_trg = pred_iou[0]
 
         if len(candidate_inds):
-            dist = ((pred_cent[0].permute(0,2,3,1).reshape(-1,1,3) - candidate_inds) ** 2)
+            dist = ((pred_cent[0].permute(0,2,3,1).reshape(-1,1,3) - candidate_inds[:,[0,2,1]]) ** 2)
             candidate_inds = (-dist.sum(dim=2)).topk(30,dim=0)[1]
-            iou_trg, reg_idx = iou_trg[candidate_inds].max(dim=0)
-            #iou_trg, reg_idx = pred_iou[0,candidate_inds].max(dim=0)
+            #iou_trg, reg_idx = iou_trg[candidate_inds].max(dim=0)
+            _, reg_idx = pred_iou[0,candidate_inds].max(dim=0)
             box_pred = box_pred[candidate_inds][reg_idx,torch.arange(len(reg_idx)),:]
             per_box_cls, per_class = pred_cls[:,candidate_inds,:].max(dim=1)[0].max(dim=-1)
             per_locations = location[candidate_inds][reg_idx, torch.arange(len(reg_idx)), :]
 
             for i in range(N):
-                boxlist = Instances(image_sizes[i])
+                boxlist = Instances(images.image_sizes[i])
                 boxlist.pred_boxes = Boxes(box_pred)
                 boxlist.scores = per_box_cls[i]
                 boxlist.pred_classes = per_class[i]
