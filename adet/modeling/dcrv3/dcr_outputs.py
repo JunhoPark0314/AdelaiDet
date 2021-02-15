@@ -14,7 +14,7 @@ from fvcore.nn import sigmoid_focal_loss_jit
 import sklearn.mixture as skm
 
 from adet.utils.comm import reduce_sum
-from adet.layers import ml_nms, IOUExtendLoss
+from adet.layers import ml_nms, IOUExtendLoss, GaussianMixture
 from detectron2.structures import pairwise_iou
 
 logger = logging.getLogger(__name__)
@@ -275,19 +275,15 @@ class DCROutputs(nn.Module):
     @torch.no_grad()
     def fit_GMM_with_crit(self, crit, device):
         min_logit, max_logit = crit.min(), crit.max()
-        means_init=[[min_logit], [max_logit]]
-        weights_init = [0.5, 0.5]
-        precisions_init=[[[1.0]], [[1.0]]]
-        gmm = skm.GaussianMixture(2,
-                                    weights_init=weights_init,
-                                    means_init=means_init,
-                                    precisions_init=precisions_init)
-        cpu_crit = crit.unsqueeze(1).cpu()
+        means_init=torch.tensor([[[min_logit], [max_logit]]]).to(crit.device)
+        precisions_init=torch.tensor([[[1.0], [1.0]]]).to(crit.device)
+        gmm = GaussianMixture(n_components = 2, n_features = 1,
+                                    mu_init=means_init,
+                                    var_init=precisions_init)
+        cpu_crit = crit.unsqueeze(1)
         gmm.fit(cpu_crit)
         components = gmm.predict(cpu_crit)
         scores = gmm.score_samples(cpu_crit)
-        components = torch.from_numpy(components).to(device)
-        scores = torch.from_numpy(scores).to(device)
 
         return components, scores
 
@@ -302,9 +298,12 @@ class DCROutputs(nn.Module):
         
         if torch.nonzero(fgs, as_tuple=False).numel() > 0:
             # Fig 3. (c)
+            thr = in_box_logits[scores[fgs].argmax()] 
+            """
             fg_max_score = scores[fgs].max().item()
             fg_max_idx = torch.nonzero(fgs & (scores == fg_max_score), as_tuple=False).min()
             thr = in_box_logits[fg_max_idx]
+            """
         else:
             # just treat all samples as positive for high recall.
             thr = 0
@@ -335,9 +334,12 @@ class DCROutputs(nn.Module):
         
         if torch.nonzero(fgs, as_tuple=False).numel() > 0:
             # Fig 3. (c)
+            thr = in_box_iou[scores[fgs].argmax()] 
+            """
             fg_max_score = scores[fgs].max().item()
             fg_max_idx = torch.nonzero(fgs & (scores == fg_max_score), as_tuple=False).min()
             thr = in_box_iou[fg_max_idx]
+            """
         else:
             # just treat all samples as positive for high recall.
             thr = 0

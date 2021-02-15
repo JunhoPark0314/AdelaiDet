@@ -6,5 +6,6 @@ from .bezier_align import BezierAlign
 from .def_roi_align import DefROIAlign
 from .naive_group_norm import NaiveGroupNorm
 from .gcn import GCN
+from .gmm import GaussianMixture
 
 __all__ = [k for k in globals().keys() if not k.startswith("_")]
