@@ -294,6 +294,7 @@ class DCROutputs(nn.Module):
     def per_target_cls_threshold_region(self, pred_cls_logits, target_dict, cls_in_boxes):
         score_per_target = pred_cls_logits[:,target_dict['gt_classes']].sigmoid()
         in_box_logits = score_per_target.squeeze(1)[cls_in_boxes]
+        in_box_logits, _ = in_box_logits.topk(min(45,len(in_box_logits)))
         components, scores = self.fit_GMM_with_crit(in_box_logits, pred_cls_logits.device)
 
         fgs = components == 1
@@ -325,6 +326,7 @@ class DCROutputs(nn.Module):
     def per_target_reg_threshold_region(self, pred_box, target_dict, reg_in_boxes):
         iou_per_target = pairwise_iou(target_dict["gt_boxes"], Boxes(pred_box))
         in_box_iou = iou_per_target.squeeze(0)[reg_in_boxes]
+        in_box_iou, _ = in_box_iou.topk(min(45,len(in_box_iou)))
 
         components, scores = self.fit_GMM_with_crit(in_box_iou, pred_box.device)
 
@@ -450,11 +452,15 @@ class DCROutputs(nn.Module):
             b = bboxes[:, 3][None] - ys[:, None]
             in_box_per_im = torch.stack([l, t, r, b], dim=2)
 
+            """
             is_in_boxes_pure = in_box_per_im.min(dim=2)[0] > 0
             is_in_boxes_surround = (in_box_per_im.min(dim=2)[0] + loc_to_strides > 0)
             no_in_box_pure = is_in_boxes_pure.sum(dim=0) <= 10
             if no_in_box_pure.any().item():
                 is_in_boxes_pure[:,no_in_box_pure] = is_in_boxes_surround[:,no_in_box_pure]
+            """
+
+            is_in_boxes_pure = (in_box_per_im.min(dim=2)[0] + loc_to_strides > 0)
 
             is_cared_in_the_level = (area_per_im >= size_ranges[:,0][:,None]) * \
                  (area_per_im < size_ranges[:,1][:,None])
@@ -465,7 +471,7 @@ class DCROutputs(nn.Module):
             }
 
             is_in_boxes = self.get_threshold_region(
-                is_in_boxes_pure * is_cared_in_the_level, 
+                is_in_boxes_pure, # * is_cared_in_the_level, 
                 pred_per_im,
                 targets_per_im, 
                 locations,
