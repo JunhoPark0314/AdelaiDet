@@ -77,7 +77,6 @@ class DCROutputs(nn.Module):
 
         self.num_classes = cfg.MODEL.DCR.NUM_CLASSES
         self.strides = cfg.MODEL.DCR.FPN_STRIDES
-        self.instance_weight = cfg.MODEL.DCR.INSTANCE_WEIGHT
         self.vis_period = cfg.VIS_PERIOD
         self.reg_on_cls = cfg.MODEL.DCR.REG_ON_CLS
 
@@ -272,51 +271,88 @@ class DCROutputs(nn.Module):
             disp_targets[l] = disp_targets[l] / float(self.strides[l])
 
         return training_target
+    
+    @torch.no_grad()
+    def fit_GMM_with_crit(self, crit, device):
+        min_logit, max_logit = crit.min(), crit.max()
+        means_init=[[min_logit], [max_logit]]
+        weights_init = [0.5, 0.5]
+        precisions_init=[[[1.0]], [[1.0]]]
+        gmm = skm.GaussianMixture(2,
+                                    weights_init=weights_init,
+                                    means_init=means_init,
+                                    precisions_init=precisions_init)
+        cpu_crit = crit.unsqueeze(1).cpu()
+        gmm.fit(cpu_crit)
+        components = gmm.predict(cpu_crit)
+        scores = gmm.score_samples(cpu_crit)
+        components = torch.from_numpy(components).to(device)
+        scores = torch.from_numpy(scores).to(device)
+
+        return components, scores
 
     def per_target_cls_threshold_region(self, pred_cls_logits, target_dict, cls_in_boxes):
-        cls_weight = None
         score_per_target = pred_cls_logits[:,target_dict['gt_classes']].sigmoid()
         in_box_logits = score_per_target.squeeze(1)[cls_in_boxes]
+        components, scores = self.fit_GMM_with_crit(in_box_logits, pred_cls_logits.device)
 
+        fgs = components == 1
+        bgs = components == 0
+        
+        if torch.nonzero(fgs, as_tuple=False).numel() > 0:
+            # Fig 3. (c)
+            fg_max_score = scores[fgs].max().item()
+            fg_max_idx = torch.nonzero(fgs & (scores == fg_max_score), as_tuple=False).min()
+            thr = in_box_logits[fg_max_idx]
+        else:
+            # just treat all samples as positive for high recall.
+            thr = 0
+
+        """
         if len(in_box_logits) > 1:
             score_mean = in_box_logits.mean()
             score_std = in_box_logits.std()
         else:
             score_mean = 0.0
             score_std = 0.0
+        """
 
-        cls_pos_per_target = (score_per_target > score_mean + score_std * self.pos_sample_rate).squeeze(1)
+        cls_pos_per_target = (score_per_target >= thr ).squeeze(1)
 
-        if self.instance_weight:
-            cls_dump = pred_cls_logits[cls_in_boxes].sigmoid()
-            cls_iw_recall = (cls_dump[:,target_dict["gt_classes"]] > self.pre_nms_thresh_test).sum() / ((cls_dump > self.pre_nms_thresh_test).sum() + 1e-6)
-            cls_weight = 1 - cls_iw_recall
-
-        return cls_pos_per_target, cls_weight
+        return cls_pos_per_target
 
 
     def per_target_reg_threshold_region(self, pred_box, target_dict, reg_in_boxes):
-        reg_weight = None
         iou_per_target = pairwise_iou(target_dict["gt_boxes"], Boxes(pred_box))
         in_box_iou = iou_per_target.squeeze(0)[reg_in_boxes]
 
+        components, scores = self.fit_GMM_with_crit(in_box_iou, pred_box.device)
+
+        fgs = components == 1
+        bgs = components == 0
+        
+        if torch.nonzero(fgs, as_tuple=False).numel() > 0:
+            # Fig 3. (c)
+            fg_max_score = scores[fgs].max().item()
+            fg_max_idx = torch.nonzero(fgs & (scores == fg_max_score), as_tuple=False).min()
+            thr = in_box_iou[fg_max_idx]
+        else:
+            # just treat all samples as positive for high recall.
+            thr = 0
+        """
         if len(in_box_iou) > 1:
             iou_mean = in_box_iou.mean()
             iou_std = in_box_iou.std()
         else:
             iou_mean = 0.0
             iou_std = 0.0
+        """
         
         #print(in_box_iou.max())
-        reg_pos_per_target = (iou_per_target >= iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
-        reg_neg_per_target = (iou_per_target < iou_mean + iou_std * self.pos_sample_rate).squeeze(0)
+        reg_pos_per_target = (iou_per_target >= thr).squeeze(0)
+        reg_neg_per_target = (iou_per_target < thr).squeeze(0)
 
-        if self.instance_weight:
-            iou_dump = iou_per_target.squeeze(0)[reg_in_boxes]
-            iou_iw_recall = ((iou_dump > 0.5).sum() / (len(iou_dump) + 1e-6))
-            reg_weight = 1 - iou_iw_recall
-
-        return reg_pos_per_target, reg_neg_per_target, reg_weight
+        return reg_pos_per_target, reg_neg_per_target
 
 
     @torch.no_grad()
@@ -333,44 +369,27 @@ class DCROutputs(nn.Module):
         pred_box[:,[0,2]] = pred_box[:,[0,2]].clamp(0, image_size[1])
         pred_box[:,[1,3]] = pred_box[:,[1,3]].clamp(0, image_size[0])
 
-        cls_weight = []
-        reg_weight = []
-
         for l in range(len(targets_per_im)):
             target = targets_per_im[l]
             target_dict = target.get_fields()
 
             # calculate logit, bbox regression threshold per object
 
-            cls_pos_per_target, cls_weight_per_target = self.per_target_cls_threshold_region(pred_result["pred_cls"], target_dict, cls_in_boxes[:,l])
+            cls_pos_per_target = self.per_target_cls_threshold_region(pred_result["pred_cls"], target_dict, cls_in_boxes[:,l])
             cls_in_boxes[:,l] *= cls_pos_per_target
 
-            reg_pos_per_target, reg_neg_per_target, reg_weight_per_target = self.per_target_reg_threshold_region(pred_box, target_dict, reg_in_boxes[:,l])
+            reg_pos_per_target, reg_neg_per_target = self.per_target_reg_threshold_region(pred_box, target_dict, reg_in_boxes[:,l])
             reg_in_boxes[:,l] *= reg_pos_per_target
             reg_neg_boxes[:,l] *= reg_neg_per_target
 
-            if self.instance_weight:
-                cls_weight.append(cls_weight_per_target)
-                reg_weight.append(reg_weight_per_target)
-
-        if self.instance_weight:
-            cls_weight = torch.stack(cls_weight)
-            reg_weight = torch.stack(reg_weight)
-
-            assert (cls_weight >= 0).all() and (cls_weight <= 1).all()
-            assert (reg_weight >= 0).all() and (reg_weight <= 1).all()
 
         in_boxes = {
             "cls": cls_in_boxes,
             "reg": reg_in_boxes,
             "reg_neg": reg_neg_boxes,
         }
-        weight = {
-            "cls": cls_weight,
-            "reg": reg_weight
-        }
 
-        return in_boxes, weight
+        return in_boxes
     
     def no_gt_cls_target(self, locations):
         target = {
@@ -445,7 +464,7 @@ class DCROutputs(nn.Module):
                 "pred_reg": cat([(x[im_i] * s).permute(1,2,0).reshape(-1,4) for x, s in zip(pred_result["pred_reg"], self.strides)]),
             }
 
-            is_in_boxes, weights  = self.get_threshold_region(
+            is_in_boxes = self.get_threshold_region(
                 is_in_boxes_pure * is_cared_in_the_level, 
                 pred_per_im,
                 targets_per_im, 
@@ -505,11 +524,12 @@ class DCROutputs(nn.Module):
                     reg_pos_inds_per_im.unique()[(reg_pos_inds_per_im.unique() != -1)]).all()
                 assert len(cls_pos_inds_per_im.unique()) == (len(targets_per_im) + 1)
             except:
-                self.write_debug_img(num_loc_list, locations, reg_pos_inds_per_im,
-                    cls_pos_inds_per_im, disp_targets_per_im, cls_pos_inds_per_im, centers, bboxes)
+                if self.vis_period > 0:
+                    self.write_debug_img(num_loc_list, locations, reg_pos_inds_per_im,
+                        cls_pos_inds_per_im, disp_targets_per_im, cls_pos_inds_per_im, centers, bboxes)
 
-            storage = get_event_storage()
             if self.vis_period > 0:
+                storage = get_event_storage()
                 if storage.iter % self.vis_period == 0 and im_i == 0:
                     self.write_debug_img(num_loc_list, locations, reg_pos_inds_per_im,
                         cls_pos_inds_per_im, disp_targets_per_im, cls_pos_inds_per_im, centers, bboxes)
@@ -535,15 +555,6 @@ class DCROutputs(nn.Module):
                 "pos_inds": cls_pos_inds_per_im,
             }
 
-            if self.instance_weight:
-                cls_weight_per_im = torch.ones(len(cls_targets_per_im), dtype=torch.float32, device=weights["cls"].device)
-                cls_weight_per_im[cls_pos_inds_per_im != -1] += weights["cls"][cls_locations_to_gt_inds][cls_pos_inds_per_im != -1]
-                cls_training_target_per_im["weights"] = cls_weight_per_im
-
-                reg_weight_per_im = torch.ones(len(reg_targets_per_im), dtype=torch.float32, device=weights["reg"].device)
-                reg_weight_per_im[reg_pos_inds_per_im != -1] += weights["reg"][reg_locations_to_gt_inds][reg_pos_inds_per_im != -1]
-                reg_training_target_per_im["weights"] = reg_weight_per_im
-            
             cls_training_target.append(cls_training_target_per_im)
             reg_training_target.append(reg_training_target_per_im)
             disp_training_target.append(disp_training_target_per_im)
@@ -580,12 +591,6 @@ class DCROutputs(nn.Module):
             x.permute(0, 2, 3, 1).reshape(-1, self.num_classes) for x in pred_result["pred_cls"] 
         ], dim=0,)
 
-        # push weight if instance weight is True
-        if self.instance_weight:
-            cls_instances.weight = cat([
-                x.reshape(-1) for x in training_target["weights"]
-            ])
-
         return cls_instances
 
     def generate_reg_instances(self, training_target, pred_result):
@@ -616,13 +621,6 @@ class DCROutputs(nn.Module):
         reg_instances.pred_iou = cat([
             x.permute(0, 2, 3, 1).reshape(-1) for x in pred_result["pred_iou"]
         ], dim=0,)
-
-        # push weight if instance weight is True
-        if self.instance_weight:
-            reg_instances.weight = cat([
-                # Reshape: (N, 1, Hi, Wi) -> (N*Hi*Wi,)
-                x.reshape(-1) for x in training_target["weights"]
-            ])
 
         return reg_instances
 
@@ -662,13 +660,6 @@ class DCROutputs(nn.Module):
             "disp": disp_instances,
             })
     
-    def compute_recall_weight(self, pred_pos, target_pos, gt_channel=0):
-
-        tp = (pred_pos * target_pos)
-        fn = (~pred_pos * target_pos)
-
-        return tp.sum() / (tp.sum() + fn.sum())
-
     def dcr_cls_losses(self, cls_instances, num_gpus):
         cls_targets = cls_instances.cls_targets.flatten()
 
@@ -682,17 +673,10 @@ class DCROutputs(nn.Module):
         class_target = torch.zeros_like(cls_instances.pred_cls)
         class_target[cls_pos_inds, cls_targets[cls_pos_inds]] = 1
 
-        if self.instance_weight:
-            # compute tp, fp, fn weight
-            tp = (cls_instances.pred_cls.sigmoid() > self.pre_nms_thresh_test) * class_target
-            fp = (cls_instances.pred_cls.sigmoid() > self.pre_nms_thresh_test) * (1 - class_target).bool()
-            cls_instances.weight[fp.any(dim=1)] += (1 - tp.sum() / (tp.sum() + fp.sum() + 1e-6))
-            cls_instances.weight /= cls_instances.weight.mean()
 
         class_loss = sigmoid_focal_loss_jit(
             cls_instances.pred_cls,
             class_target,
-            weight=cls_instances.weight.unsqueeze(1) if self.instance_weight else None,
             alpha=self.focal_loss_alpha,
             gamma=self.focal_loss_gamma,
             reduction="sum",
@@ -715,9 +699,6 @@ class DCROutputs(nn.Module):
         total_reg_num_neg = reduce_sum(num_reg_neg_local).item()
         num_reg_neg_avg= max(total_reg_num_neg / num_gpus, 1.0)
 
-        if self.instance_weight:
-            reg_instances.weight /= reg_instances.weight.mean()
-
         if reg_pos_inds.numel() + reg_neg_inds.numel() > 0:
             iou_loss = self.iou_loss_func(
                 reg_instances.pred_iou[reg_pos_inds + reg_neg_inds],
@@ -735,7 +716,6 @@ class DCROutputs(nn.Module):
             reg_loss = self.loc_loss_func(
                 torch.cat([reg_ctr - reg_wh / 2, reg_ctr + reg_wh / 2],dim=1),
                 torch.cat([trg_ctr - trg_wh / 2, trg_ctr + trg_wh / 2],dim=1),
-                weight=reg_instances.reg_weight.unsqueeze(1) if hasattr(reg_instances, "reg_weight") else None,
             ) / num_reg_pos_avg
 
         else:
@@ -907,16 +887,27 @@ class DCROutputs(nn.Module):
             analysis["pt"].append(self.calc_stat(reg_pos_inds, pred_iou > self.pre_nms_thresh))
 
             _, gt_touch, gt_cent = self.iterate_disp([disp_target],disp_pos_inds, self_dir, images[0])
-            print(gt_cent)
             pred_cent = gt_cent
             pred_iou = iou_trg.unsqueeze(0)
 
+            cls_target_pos = bundle["cls_pos_inds"].unsqueeze(1) == bundle["cls_pos_inds"].unique()[bundle["cls_pos_inds"].unique() != -1]
+            reg_target_pos = bundle["reg_pos_inds"].unsqueeze(1) == bundle["reg_pos_inds"].unique()[bundle["reg_pos_inds"].unique() != -1]
+            if reg_target_pos.shape[1] == cls_target_pos.shape[1]:
+                max_iou_per_target = []
+                max_score_per_target = []
+                for i in range((bundle["reg_pos_inds"].unique() != -1).sum()):
+                    max_iou_per_target.append(iou_trg[reg_target_pos[:,i]].max())
+                    max_score_per_target.append(pred_cls[0,cls_target_pos[:,i],cls_target[cls_target_pos[:,i]]].max())
+
+                analysis["max_iou"].extend(max_iou_per_target)
+                analysis["max_score"].extend(max_score_per_target)
+            
         if "cls_target" in bundle:
-            cls_id = bundle["cls_pos_inds"].unique()[1:]
-            reg_id = bundle["reg_pos_inds"].unique()[1:]
+            cls_id = bundle["cls_pos_inds"].unique()[bundle["cls_pos_inds"].unique() != -1] 
+            reg_id = bundle["reg_pos_inds"].unique()[bundle["reg_pos_inds"].unique() != -1] 
             if (len(cls_id) != 0) and (len(cls_id) == len(reg_id)) and (cls_id == reg_id).all().item():
-                cls_pos = (bundle["cls_pos_inds"].unsqueeze(1) == bundle["cls_pos_inds"].unique()[1:])
-                reg_pos = (bundle["reg_pos_inds"].unsqueeze(1) == bundle["reg_pos_inds"].unique()[1:])
+                cls_pos = (bundle["cls_pos_inds"].unsqueeze(1) == cls_id)
+                reg_pos = (bundle["reg_pos_inds"].unsqueeze(1) == reg_id)
                 box_cls = []
                 box_class = []
                 pred_box = []
