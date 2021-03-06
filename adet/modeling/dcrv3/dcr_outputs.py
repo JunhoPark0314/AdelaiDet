@@ -79,6 +79,7 @@ class DCROutputs(nn.Module):
         self.strides = cfg.MODEL.DCR.FPN_STRIDES
         self.vis_period = cfg.VIS_PERIOD
         self.reg_on_cls = cfg.MODEL.DCR.REG_ON_CLS
+        self.pre_gmm_topk = 200
 
 
         # generate sizes of interest
@@ -290,7 +291,7 @@ class DCROutputs(nn.Module):
     def per_target_cls_threshold_region(self, pred_cls_logits, target_dict, cls_in_boxes):
         score_per_target = pred_cls_logits[:,target_dict['gt_classes']].sigmoid()
         in_box_logits = score_per_target.squeeze(1)[cls_in_boxes]
-        in_box_logits, _ = in_box_logits.topk(min(45,len(in_box_logits)))
+        in_box_logits, _ = in_box_logits.topk(min(self.pre_gmm_topk,len(in_box_logits)))
         components, scores = self.fit_GMM_with_crit(in_box_logits, pred_cls_logits.device)
 
         fgs = components == 1
@@ -325,7 +326,7 @@ class DCROutputs(nn.Module):
     def per_target_reg_threshold_region(self, pred_box, target_dict, reg_in_boxes):
         iou_per_target = pairwise_iou(target_dict["gt_boxes"], Boxes(pred_box))
         in_box_iou = iou_per_target.squeeze(0)[reg_in_boxes]
-        in_box_iou, _ = in_box_iou.topk(min(45,len(in_box_iou)))
+        in_box_iou, _ = in_box_iou.topk(min(self.pre_gmm_topk,len(in_box_iou)))
 
         components, scores = self.fit_GMM_with_crit(in_box_iou, pred_box.device)
 
@@ -473,7 +474,7 @@ class DCROutputs(nn.Module):
             }
 
             is_in_boxes = self.get_threshold_region(
-                is_in_boxes_pure, # * is_cared_in_the_level, 
+                is_in_boxes_pure, * is_cared_in_the_level, 
                 pred_per_im,
                 targets_per_im, 
                 locations,
